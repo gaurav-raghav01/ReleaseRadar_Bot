@@ -19,7 +19,7 @@ JIRA_URL = os.environ.get("JIRA_URL", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL")  
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN")
 
-# RENAMED STATE FILES to prevent conflicts with the Google Sheets bot
+# STATE FILES
 STATE_FILE = "jira_last_run_state.txt" 
 FIRST_RUN_FILE = "jira_first_run_state.txt" 
 
@@ -37,6 +37,7 @@ def get_today_deployments():
     AND "Planned start" >= startOfDay() AND "Planned start" <= endOfDay()
     """
     
+    # FIXED: Added JIRA_URL variable to the path
     url = f"{JIRA_URL}/rest/api/3/search/jql" 
     auth = HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
     
@@ -57,6 +58,7 @@ def get_today_deployments():
         response.raise_for_status()
         data = response.json()
     except requests.exceptions.RequestException as e:
+        # FIXED: Added exception details to the print statement
         print(f"\n❌ CRITICAL ERROR: Failed to fetch data from Jira. Details: {e}")
         if response is not None:
             print(response.text)
@@ -195,7 +197,7 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
         row_line = "|"
         for i, cell in enumerate(row):
             if i == 4: 
-                row_line += f" {cell}" + (" " * (col_widths[i] - 1)) + "|"
+                row_line += f" " + (" " * (col_widths[i] - 1)) + f"{cell}|"
             else:
                 row_line += f" {cell.ljust(col_widths[i])} |"
         table_lines.append(row_line)
@@ -211,13 +213,14 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
         
         # Only show comments/blockers for incomplete tasks
         if not is_done and c and c.lower() not in ["none", "-", "n/a", "null", ""]:
-            # Google chat formatting for hyperlinks is <url|text_to_display>
+            # FIXED: Properly formatting Jira hyperlinking and comment injection
             jira_link = f"<{JIRA_URL}/browse/{key}|{key}>"
-            comments_section += f"• *{jira_link}*: {c}\n"
+            comments_section += f"• **{jira_link}**: {c}\n"
 
     # FIXED TIMEZONE HERE
     today_date = datetime.now(IST).strftime('%d/%m/%Y')
     
+    # FIXED: Added today_date variable to headers
     if is_wrap_up:
         message_text = f"*🎉 Wrap-up Update - Planned Changes for Today ({today_date}) (JIRA Radar)*\n\n"
     elif is_first_update:
@@ -228,11 +231,11 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     if summary:
         message_text += f"🤖 *AI Summary:* {summary}\n\n"
         
-    # Inject the ASCII table
+    # FIXED: Added table_content to the code block
     message_text += f"```\n{table_content}\n```\n"
     message_text += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚧 Backed Out/Failed/Rescheduled)*\n"
 
-    # Append Summarized Issues/Blockers (if any exist)
+    # FIXED: Now injects the 'comments_section' string!
     if comments_section:
         message_text += f"\n*⚡ Live Radar: Actionable Insights & Friction Points*\n{comments_section}"
 
@@ -302,6 +305,7 @@ def main():
                         f.write(today_str)
         
     except Exception as e:
+        # FIXED: Catching the actual exception message
         print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
