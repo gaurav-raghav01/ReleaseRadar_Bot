@@ -104,11 +104,21 @@ def are_all_tasks_completed(deployments):
     if not deployments:
         return True 
     for row in deployments:
-        # Pad row just in case
         padded_row = row + [""] * (10 - len(row)) if len(row) < 10 else row
-        raw_status = str(padded_row[7]).strip().lower()
-        # If status is 0, blank, or pending, it is NOT done.
-        if raw_status in ['0', 'pending', 'in progress', 'scheduled', 'started', '']:
+        
+        is_done = False
+        # Scan the final columns dynamically to find the status safely
+        for i in range(7, min(10, len(padded_row))):
+            val = str(padded_row[i]).strip().lower()
+            if val in ["1", "1.0", "done", "completed", "success", "true"]:
+                is_done = True
+                break
+            elif val in ["0", "0.0", "pending", "scheduled", "false"]:
+                is_done = False
+                break
+        
+        # If we didn't explicitly find a "1", it's pending.
+        if not is_done:
             return False 
     return True 
 
@@ -118,23 +128,27 @@ def process_deployment_data(deployments):
     for row in deployments:
         padded_row = row + [""] * (10 - len(row)) if len(row) < 10 else row
         
-        # Mapping mapped exactly to your screenshot
         change_no = str(padded_row[1]).strip()
         environment = str(padded_row[2]).strip()
         application = str(padded_row[4]).strip()
         short_desc = str(padded_row[5]).strip()
         implementer = str(padded_row[6]).strip()
-        raw_status = str(padded_row[7]).strip().lower()
         
-        if raw_status in ["1", "done", "completed", "success"]:
-            status_emoji = "✅"
-            status_text = "Done"
-        elif raw_status in ["0", "pending", "scheduled", ""]:
-            status_emoji = "⏳"
-            status_text = "Pending"
-        else:
-            status_emoji = "🚧"
-            status_text = "In Progress"
+        # SAFE DEFAULT
+        status_emoji = "⏳"
+        status_text = "Pending"
+        
+        # Scan the final columns dynamically to find the status safely
+        for i in range(7, min(10, len(padded_row))):
+            val = str(padded_row[i]).strip().lower()
+            if val in ["1", "1.0", "done", "completed", "success", "true"]:
+                status_emoji = "✅"
+                status_text = "Done"
+                break
+            elif val in ["0", "0.0", "pending", "scheduled", "false"]:
+                status_emoji = "⏳"
+                status_text = "Pending"
+                break
 
         parsed_deployments.append({
             "change_no": change_no,
@@ -148,7 +162,6 @@ def process_deployment_data(deployments):
         })
 
     return {
-        "executive_summary": "Here is the summary of today's deployments and their active status.",
         "deployments": parsed_deployments
     }
 
@@ -158,12 +171,10 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
         return False
     
     if not WEBHOOK_URL:
-        print("\n❌ FATAL ERROR: WEBHOOK_URL is empty! Did you add the secret to GitHub?")
+        print("\n❌ FATAL ERROR: WEBHOOK_URL is empty!")
         return False
 
     print("\nSending formatted table message to Chat...")
-    
-    summary = card_data.get("executive_summary", "")
     deployments = card_data["deployments"]
 
     headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
@@ -176,7 +187,6 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
         env = str(dep.get('environment', 'N/A'))[:6]    
         status_emoji = dep.get('status_emoji', '⏳')
         owner = str(dep.get('implementer', 'N/A'))[:10]  
-        
         rows.append([change_no, app, desc, env, status_emoji, owner])
 
     col_widths = [len(h) for h in headers]
@@ -214,8 +224,6 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     payload = {"text": message_text}
     headers_req = {"Content-Type": "application/json"}
     
-    print(f"DEBUG: Webhook URL starts with: {WEBHOOK_URL[:30]}...")
-    
     response = requests.post(WEBHOOK_URL, headers=headers_req, data=json.dumps(payload))
     if response.status_code == 200:
         print("✅ TABLE message sent successfully to Chat Space!")
@@ -224,17 +232,9 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
         print(f"❌ Failed to send message: {response.status_code}, {response.text}")
         return False
 
-
 def main():
     try:
         today_deployments = get_today_deployments()
-        
-        print(f"\n--- DEBUG LOGS ---")
-        print(f"Number of rows found for today: {len(today_deployments)}")
-        for i, d in enumerate(today_deployments):
-             print(f"Row {i} raw data: {d}")
-        print(f"------------------\n")
-        
         if not today_deployments:
             print("No deployments found for today. Exiting.")
             sys.exit(0)
