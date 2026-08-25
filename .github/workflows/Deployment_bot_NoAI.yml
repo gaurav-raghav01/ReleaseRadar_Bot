@@ -1,4 +1,4 @@
-name: Deployment Updates Bot
+name: Deployment Updates Bot NoAI
 
 on:
   schedule:
