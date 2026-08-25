@@ -35,7 +35,7 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json 
           WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }}
-        run: python deployment_botNoAI.py
+        run: python -u deployment_botNoAI.py
 
       - name: Save Bot State Files (Auto-Commit)
         uses: stefanzweifel/git-auto-commit-action@v5
