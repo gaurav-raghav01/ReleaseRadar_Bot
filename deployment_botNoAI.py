@@ -100,27 +100,37 @@ def get_today_deployments():
             
     return today_deployments
 
+
 def are_all_tasks_completed(deployments):
     if not deployments:
         return True 
     for row in deployments:
         padded_row = row + [""] * (10 - len(row)) if len(row) < 10 else row
         
-        is_done = False
-        # Scan the final columns dynamically to find the status safely
-        for i in range(7, min(10, len(padded_row))):
-            val = str(padded_row[i]).strip().lower()
-            if val in ["1", "1.0", "done", "completed", "success", "true"]:
-                is_done = True
+        is_active_for_today = True # Assume it's pending/active until we find proof it's finished
+        
+        # Scan from column 7 (Start Time/Status) onwards
+        for cell in padded_row[7:]:
+            val = str(cell).strip().lower()
+            if not val:
+                continue
+                
+            if "done" in val or "completed" in val or "success" in val:
+                is_active_for_today = False # Finished successfully
                 break
-            elif val in ["0", "0.0", "pending", "scheduled", "false"]:
-                is_done = False
+            elif "cancel" in val or "reschedule" in val or "backed out" in val:
+                is_active_for_today = False # Not happening today, so don't wait for it
+                break
+            elif "in progress" in val or "pending" in val or "started" in val:
+                is_active_for_today = True # Still working on it
                 break
         
-        # If we didn't explicitly find a "1", it's pending.
-        if not is_done:
+        # If even a single task is active/pending, the day is NOT complete.
+        if is_active_for_today:
             return False 
+            
     return True 
+
 
 def process_deployment_data(deployments):
     parsed_deployments = []
@@ -138,14 +148,25 @@ def process_deployment_data(deployments):
         status_emoji = "⏳"
         status_text = "Pending"
         
-        # Scan the final columns dynamically to find the status safely
-        for i in range(7, min(10, len(padded_row))):
-            val = str(padded_row[i]).strip().lower()
-            if val in ["1", "1.0", "done", "completed", "success", "true"]:
+        # Scan from column 7 (Start Time/Status) to match exact dropdown words
+        for cell in padded_row[7:]:
+            val = str(cell).strip().lower()
+            if not val:
+                continue
+                
+            if "done" in val or "completed" in val or "success" in val:
                 status_emoji = "✅"
                 status_text = "Done"
                 break
-            elif val in ["0", "0.0", "pending", "scheduled", "false"]:
+            elif "in progress" in val or "started" in val:
+                status_emoji = "⚙️"
+                status_text = "In Progress"
+                break
+            elif "cancel" in val or "reschedule" in val or "backed out" in val:
+                status_emoji = "🚧"
+                status_text = "Rescheduled/Failed"
+                break
+            elif "pending" in val or "scheduled" in val:
                 status_emoji = "⏳"
                 status_text = "Pending"
                 break
@@ -164,6 +185,7 @@ def process_deployment_data(deployments):
     return {
         "deployments": parsed_deployments
     }
+
 
 def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     if not card_data or "deployments" not in card_data:
@@ -219,7 +241,7 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
         message_text = f"*Hi All, Update - Planned Changes for Today ({today_date})*\n\n"
         
     message_text += f"```\n{table_content}\n```\n"
-    message_text += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚧 Rescheduled/Failed)*\n"
+    message_text += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚧 Rescheduled/Cancelled)*\n"
 
     payload = {"text": message_text}
     headers_req = {"Content-Type": "application/json"}
@@ -231,6 +253,7 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     else:
         print(f"❌ Failed to send message: {response.status_code}, {response.text}")
         return False
+
 
 def main():
     try:
