@@ -2,7 +2,7 @@ name: Deployment Updates Bot NoAI
 
 on:
   schedule:
-    - cron: '30 3,5,7,9,11,13,15 * * *'
+    #- cron: '30 3,5,7,9,11,13,15 * * *'
   workflow_dispatch: {} 
 
 jobs:
