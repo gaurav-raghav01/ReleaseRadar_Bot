@@ -9,7 +9,7 @@ import vertexai
 from vertexai.generative_models import GenerativeModel
 
 # --- CONFIGURATION ---
-PROJECT_ID = "prj-c-platformtools-fn8z" 
+PROJECT_ID = "prj-s-ai-bot-4rl8" 
 LOCATION = "us-central1"  
 IST = timezone(timedelta(hours=5, minutes=30))
 
