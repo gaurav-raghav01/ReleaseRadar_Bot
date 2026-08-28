@@ -1,7 +1,7 @@
 name: Deployment Updates Bot
 
 on:
-  schedule:
+  #schedule:
     # IST (UTC+5:30) converted to UTC
     # 09:00 IST = 03:30 UTC
     # 11:00 IST = 05:30 UTC
@@ -10,7 +10,7 @@ on:
     # 17:00 IST = 11:30 UTC
     # 19:00 IST = 13:30 UTC
     # 21:00 IST = 15:30 UTC
-    - cron: '30 3,5,7,9,11,13,15 * * *'
+    #- cron: '30 3,5,7,9,11,13,15 * * *'
     
   workflow_dispatch: {} 
 
