@@ -32,7 +32,7 @@ jobs:
       - name: Run Deployment Bot
         env:
           GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json 
-          WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }}
+          WEBHOOK_URL: ${{ secrets.PROD_GC_WEBHOOK_URL }}
         run: python deployment_bot.py
 
       - name: Save Bot State Files (Auto-Commit)
