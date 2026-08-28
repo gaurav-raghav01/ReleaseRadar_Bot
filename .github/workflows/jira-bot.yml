@@ -4,7 +4,7 @@ on:
   schedule:
     # Staggered by 5 mins to prevent Git push conflicts with the Sheets bot
     # Runs at 9:05, 11:05, 13:05, 15:05, 17:05, 19:05, 21:05 IST
-    - cron: '35 3,5,7,9,11,13,15 * * *'
+    # - cron: '35 3,5,7,9,11,13,15 * * *'
     
   workflow_dispatch: {} # Explicit empty object prevents YAML linter errors for UI triggers
 
