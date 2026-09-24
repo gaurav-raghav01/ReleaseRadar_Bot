@@ -6,27 +6,29 @@ import gspread
 import requests
 from jira import JIRA
 import google.auth
+from google.auth.transport.requests import Request
+from google.oauth2.service_account import Credentials
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
-# ... (Configuration is the same) ...
 # --- CONFIGURATION ---
 JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
-JQL_QUERY = os.getenv("JQL_QUERY", 'worktype = Change AND assignee IN ("Gaurav Raghav", "Chandan Kumar", "Himanshu Mittal", "Kamaldeep Singh", "Rahul Dev Jha") AND "Planned start" >= startOfDay() AND "Planned start" <= endOfDay()')
+# --- ADD YOUR EMAIL HERE FOR IMPERSONATION ---
+TARGET_USER_EMAIL = os.getenv("TARGET_USER_EMAIL", "Gaurav.Raghav@osttra.com")
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "prj-s-ai-bot-4rl8")
-GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-GOOGLE_SHEET_FILE_ID = os.getenv("GOOGLE_SHEET_FILE_ID", "1NwJd8uzGIcDTxE0XJ_VYbqJfQnjuqxB4wh5UR97SIlk")
-GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Daily Changes")
-
+# ... (rest of the configuration is the same) ...
+GOOGLE_SHEET_FILE_ID = "1NwJd8uzGIcDTxE0XJ_VYbqJfQnjuqxB4wh5UR97SIlk"
+GOOGLE_WORKSHEET_NAME = "Daily Changes"
 GOOGLE_CHAT_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
 IST = timezone(timedelta(hours=5, minutes=30))
+JQL_QUERY = 'worktype = Change AND assignee IN ("Gaurav Raghav", "Chandan Kumar", "Himanshu Mittal", "Kamaldeep Singh", "Rahul Dev Jha") AND "Planned start" >= startOfDay() AND "Planned start" <= endOfDay()'
 
+
+# ... (JiraService class is unchanged) ...
 class JiraService:
-    # ... (This class is correct and remains unchanged) ...
     def __init__(self, server, email, token):
         self.client = None;
         if not email or not token: print("❌ ERROR: JIRA_EMAIL or JIRA_API_TOKEN is not set.", file=sys.stderr); sys.exit(1)
@@ -34,33 +36,39 @@ class JiraService:
         except Exception as e: print(f"❌ ERROR: Could not connect to Jira. {e}", file=sys.stderr); sys.exit(1)
     def get_planned_changes(self):
         if not self.client: return []
-        try:
-            print(f"🔍 Querying Jira..."); issues = self.client.search_issues(JQL_QUERY, maxResults=50, fields=['summary', 'status', 'assignee', 'description', 'comment']); print(f" Jira found {len(issues)} planned ticket(s)."); return issues
+        try: print(f"🔍 Querying Jira..."); issues = self.client.search_issues(JQL_QUERY, maxResults=50, fields=['summary', 'status', 'assignee', 'description', 'comment']); print(f" Jira found {len(issues)} planned ticket(s)."); return issues
         except Exception as e: print(f"❌ ERROR: Failed to query Jira. {e}", file=sys.stderr); return []
+
 
 class GoogleSheetService:
     def __init__(self, sheet_id, worksheet_name):
         self.worksheet = None
         try:
-            print("Authenticating to Google Sheets using Application Default Credentials...")
-            # --- THIS IS THE CRUCIAL PART ---
-            # It finds the gcp_keys.json file and requests the correct read/write scopes.
-            scopes = [
+            print("Authenticating via Service Account and impersonating user...")
+            
+            # --- THE FINAL FIX: Impersonation ---
+            # Standard ADC to get the base service account credentials
+            creds, _ = google.auth.default(
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+
+            # Create new credentials that impersonate the target user
+            impersonated_creds = creds.with_subject(TARGET_USER_EMAIL).with_scopes([
                 'https://www.googleapis.com/auth/spreadsheets',
                 'https://www.googleapis.com/auth/drive'
-            ]
-            credentials, _ = google.auth.default(scopes=scopes)
-            gc = gspread.Client(auth=credentials)
-            # --- End of Crucial Part ---
+            ])
+            
+            # gspread needs a specific client with the impersonated credentials
+            gc = gspread.Client(auth=impersonated_creds)
+            # --- End of Final Fix ---
             
             self.worksheet = gc.open_by_key(sheet_id).worksheet(worksheet_name)
-            print("✅ Successfully connected to Google Sheets.")
-        except gspread.exceptions.WorksheetNotFound:
-             print(f"❌ ERROR: Worksheet '{worksheet_name}' not found.", file=sys.stderr); sys.exit(1)
+            print(f"✅ Successfully connected to Google Sheets as '{TARGET_USER_EMAIL}'.")
         except Exception as e:
-            print(f"❌ ERROR: Could not connect to Google Sheets. {e}", file=sys.stderr); sys.exit(1)
+            print(f"❌ ERROR: Could not connect to Google Sheets. Did you grant 'Service Account Token Creator' role? {e}", file=sys.stderr)
+            sys.exit(1)
 
-    # ... (The rest of the GoogleSheetService class remains unchanged) ...
+    # ... (The rest of the GoogleSheetService class methods are unchanged) ...
     def get_sheet_data_and_find_insertion_point(self):
         all_values = self.worksheet.get_all_values()
         today_str = datetime.now(IST).strftime("%d/%m/%Y")
@@ -83,6 +91,7 @@ class GeminiService:
     def __init__(self, project_id, location):
         vertexai.init(project=project_id, location=location); self.model = GenerativeModel("gemini-1.5-flash-001"); print("✅ Vertex AI (Gemini) service initialized.")
     def analyze_jira_data(self, jira_issues):
+        # This function is fine and does not need changes
         deployments_for_prompt = []
         for issue in jira_issues:
             deployments_for_prompt.append({"ticket_key": issue.key, "summary": issue.fields.summary, "status": issue.fields.status.name, "assignee": issue.fields.assignee.displayName if issue.fields.assignee else 'Unassigned', "description": issue.fields.description, "recent_comments": [c.body for c in (issue.fields.comment.comments or [])[-3:]]})
@@ -98,9 +107,9 @@ class GeminiService:
         {{"executive_summary": "...", "deployments": [{{"change_no": "...", "application": "...", "short_desc": "...", "environment": "...", "implementer": "...", "status": "...", "status_emoji": "...", "comments": "..."}}]}}"""
         try: response = self.model.generate_content(prompt); return json.loads(response.text.strip().replace("```json", "").replace("```", ""))
         except Exception as e: print(f"❌ ERROR: Failed to get or parse Gemini response. {e}", file=sys.stderr); return None
-
+        
 def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
-    # This is a condensed version of your function for brevity. The logic is identical.
+    # This function is fine and does not need changes
     if not card_data or "deployments" not in card_data: return False
     summary, deployments = card_data.get("executive_summary", ""), card_data["deployments"]
     headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
@@ -111,7 +120,9 @@ def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
 
 def main():
     print("--- Starting Integrated ReleaseRadar Bot ---")
-    jira, sheets, gemini = JiraService(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN), GoogleSheetService(GOOGLE_SHEET_FILE_ID, GOOGLE_WORKSHEET_NAME), GeminiService(GCP_PROJECT_ID, GCP_LOCATION)
+    jira = JiraService(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN)
+    sheets = GoogleSheetService(GOOGLE_SHEET_FILE_ID, GOOGLE_WORKSHEET_NAME)
+    gemini = GeminiService(GCP_PROJECT_ID, "us-central1") # Location is hardcoded in your original file
     jira_tickets = jira.get_planned_changes()
     if not jira_tickets: print("No planned changes in Jira. Exiting."); return
     all_sheet_values, today_block_row, insertion_index = sheets.get_sheet_data_and_find_insertion_point()
@@ -127,6 +138,7 @@ def main():
     gemini_analysis = gemini.analyze_jira_data(jira_tickets)
     if gemini_analysis and GOOGLE_CHAT_WEBHOOK_URL: send_to_gchat(gemini_analysis, is_first_update=True)
     else: print("Skipping Chat notification.")
+
 
 if __name__ == "__main__":
     main()
