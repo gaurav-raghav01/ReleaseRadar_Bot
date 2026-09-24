@@ -38,7 +38,7 @@ jobs:
       - name: Run Integrated ReleaseRadar Bot
         # --- IMPORTANT: Change this to run the correct, single script ---
         env:
-          WEBHOOK_URL: ${{ secrets.PROD_GC_WEBHOOK_URL }}
+          WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
