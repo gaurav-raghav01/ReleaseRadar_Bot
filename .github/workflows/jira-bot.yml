@@ -2,19 +2,32 @@ name: ReleaseRadar Bot - Integrated
 
 on:
   schedule:
-    # Runs every 30 minutes on weekdays (IST) during business hours
     - cron: '*/30 3-14 * * 1-5'
-  workflow_dispatch: {} # Allows manual runs
+  workflow_dispatch: {}
 
 jobs:
   run-release-radar:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: 'read'
+      id-token: 'write' # Required for the new Google Auth action
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      # --- THE FIX IS HERE: Add Google Auth Step ---
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+          # This explicitly requests the scopes needed to write to Sheets and Drive
+          scopes: |-
+            https://www.googleapis.com/auth/cloud-platform
+            https://www.googleapis.com/auth/drive
+            https://www.googleapis.com/auth/spreadsheets
+      # --- End of Fix ---
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,22 +37,16 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          # --- THE FIX IS HERE ---
-          # Force uninstall the wrong 'jira-python' library first
           pip uninstall -y jira-python
-          # Now, install the correct libraries
-          pip install gspread oauth2client jira requests google-auth google-api-python-client vertexai
+          pip install gspread jira requests google-auth google-api-python-client vertexai
 
-      - name: Inject GCP Credentials
-        env:
-          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
-        run: echo "$GCP_CREDENTIALS" > gcp_keys.json
+      # Note: We no longer need the "Inject GCP Credentials" step because the 'google-github-actions/auth'
+      # step handles setting up the environment for ADC automatically.
 
       - name: Run Integrated ReleaseRadar Bot
-        # --- IMPORTANT: Change this to run the correct, single script ---
         env:
           WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
-        run: python jira_deployment_bot.py # Use the new integrated script
+          # The GOOGLE_APPLICATION_CREDENTIALS env var is now set by the Google Auth action
+        run: python jira_deployment_bot.py
