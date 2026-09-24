@@ -10,24 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: 'read'
-      id-token: 'write' # Required for the new Google Auth action
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      # --- THE FIX IS HERE: Add Google Auth Step ---
-      - name: Authenticate to Google Cloud
-        id: auth
-        uses: 'google-github-actions/auth@v2'
-        with:
-          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
-          # This explicitly requests the scopes needed to write to Sheets and Drive
-          scopes: |-
-            https://www.googleapis.com/auth/cloud-platform
-            https://www.googleapis.com/auth/drive
-            https://www.googleapis.com/auth/spreadsheets
-      # --- End of Fix ---
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,13 +26,20 @@ jobs:
           pip uninstall -y jira-python
           pip install gspread jira requests google-auth google-api-python-client vertexai
 
-      # Note: We no longer need the "Inject GCP Credentials" step because the 'google-github-actions/auth'
-      # step handles setting up the environment for ADC automatically.
+      # --- THIS IS THE CORRECT METHOD FOR YOUR CREDENTIALS ---
+      - name: Inject GCP Credentials
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: echo "$GCP_CREDENTIALS" > gcp_keys.json
+      # --- End of Fix ---
 
       - name: Run Integrated ReleaseRadar Bot
         env:
-          WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }}
+          # This tells all Google libraries to use the file we just created
+          GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
+          
+          # Other secrets
+          WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }} # Using the non-prod webhook for testing
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          # The GOOGLE_APPLICATION_CREDENTIALS env var is now set by the Google Auth action
         run: python jira_deployment_bot.py
