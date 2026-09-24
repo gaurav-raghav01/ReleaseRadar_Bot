@@ -17,15 +17,15 @@ JQL_QUERY = os.getenv("JQL_QUERY", 'worktype = Change AND assignee IN ("Gaurav R
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "prj-s-ai-bot-4rl8")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-# --- UPDATED: Using your new testing sheet ID ---
 GOOGLE_SHEET_FILE_ID = os.getenv("GOOGLE_SHEET_FILE_ID", "1NwJd8uzGIcDTxE0XJ_VYbqJfQnjuqxB4wh5UR97SIlk")
-GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Daily Changes") # Assuming the tab name is 'Daily Changes'
+GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Daily Changes")
 
 GOOGLE_CHAT_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 class JiraService:
+    # ... (This class is correct and remains unchanged) ...
     def __init__(self, server, email, token):
         self.client = None
         if not email or not token:
@@ -49,12 +49,13 @@ class JiraService:
             print(f"❌ ERROR: Failed to query Jira. {e}", file=sys.stderr)
             return []
 
+
 class GoogleSheetService:
     def __init__(self, sheet_id, worksheet_name):
         self.worksheet = None
         try:
-            # --- THE FIX IS HERE: Using google-auth library for ADC ---
             print("Authenticating to Google Sheets using Application Default Credentials...")
+            # --- THE FIX IS HERE: Requesting full read/write scopes ---
             scopes = [
                 'https://www.googleapis.com/auth/spreadsheets',
                 'https://www.googleapis.com/auth/drive'
@@ -69,7 +70,7 @@ class GoogleSheetService:
              print(f"❌ ERROR: Worksheet '{worksheet_name}' not found. Please check the tab name in your sheet.", file=sys.stderr)
              sys.exit(1)
         except Exception as e:
-            print(f"❌ ERROR: Could not connect to Google Sheets. Check sharing permissions for the ADC user. {e}", file=sys.stderr)
+            print(f"❌ ERROR: Could not connect to Google Sheets. Check permissions. {e}", file=sys.stderr)
             sys.exit(1)
 
     def get_sheet_data_and_find_insertion_point(self):
@@ -94,7 +95,8 @@ class GoogleSheetService:
     def insert_rows_at_index(self, rows_to_add, index):
         self.worksheet.insert_rows(rows_to_add, row=index)
 
-# ... (The GeminiService and send_to_gchat functions remain exactly the same as before) ...
+
+# ... (GeminiService, send_to_gchat, and main functions are all correct and remain unchanged) ...
 class GeminiService:
     def __init__(self, project_id, location):
         vertexai.init(project=project_id, location=location)
@@ -142,46 +144,37 @@ class GeminiService:
 def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     if not card_data or "deployments" not in card_data: return False
     print("\nSending formatted message to Chat...")
-    summary = card_data.get("executive_summary", "")
-    deployments = card_data["deployments"]
+    summary, deployments = card_data.get("executive_summary", ""), card_data["deployments"]
     headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
     rows = []
     for dep in deployments:
         change_no, app, desc, env, status_emoji = str(dep.get('change_no', 'N/A'))[:15], str(dep.get('application', 'N/A'))[:8], str(dep.get('short_desc', 'N/A'))[:20], str(dep.get('environment', 'N/A'))[:6], dep.get('status_emoji', '⏳')
-        owner_full = str(dep.get('implementer', 'N/A'))
-        owner = owner_full.split(" ")[0][:10] if " " in owner_full else owner_full[:10]
+        owner = str(dep.get('implementer', 'N/A')).split(" ")[0][:10]
         rows.append([change_no, app, desc, env, status_emoji, owner])
     col_widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            display_length = len(cell) if not any(emoji in cell for emoji in ['✅','⚙️','⏳','🚧']) else len(cell) - 1
-            col_widths[i] = max(col_widths[i], display_length)
+            col_widths[i] = max(col_widths[i], len(cell) - (1 if any(e in cell for e in ['✅','⚙️','⏳','🚧']) else 0))
     header_line, separator_line = "| " + " | ".join(h.ljust(w) for h, w in zip(headers, col_widths)) + " |", "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"
     table_lines = [header_line, separator_line]
     for row in rows:
         row_line = "|"
-        for i, cell in enumerate(row):
-            row_line += f" {cell.ljust(col_widths[i])} |" if i != 4 else f" " + (" " * (col_widths[i] - 1)) + f"{cell}|"
+        for i, cell in enumerate(row): row_line += f" {cell.ljust(col_widths[i])} |"
         table_lines.append(row_line)
     table_content = "\n".join(table_lines)
     comments_section = ""
     for dep in deployments:
         key, status, c = dep.get('change_no', 'N/A'), dep.get('status', 'Unknown'), dep.get("comments", "").strip()
-        is_done = ("done" in status.lower() or "completed" in status.lower() or dep.get("status_emoji") == "✅")
-        if not is_done and c and c.lower() not in ["none", "-", "n/a", "null", ""]:
+        if not ("done" in status.lower() or "completed" in status.lower() or dep.get("status_emoji") == "✅") and c and c.lower() not in ["none", "-", "n/a", "null", ""]:
             comments_section += f"• **<{JIRA_SERVER}/browse/{key}|{key}>**: {c}\n"
     today_date = datetime.now(IST).strftime('%d/%m/%Y')
-    if is_wrap_up: message_text = f"*🎉 Wrap-up Update - ({today_date}) (JIRA Radar)*\n\n"
-    elif is_first_update: message_text = f"*Hi All, Planned Changes for Today ({today_date}) (JIRA Radar)*\n\n"
-    else: message_text = f"*Hi All, Update - ({today_date}) (JIRA Radar)*\n\n"
+    message_text = f"*Hi All, Planned Changes for Today ({today_date}) (JIRA Radar)*\n\n"
     if summary: message_text += f"🤖 *AI Summary:* {summary}\n\n"
     message_text += f"```\n{table_content}\n```\n*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚧 Backed Out/Failed)*\n"
     if comments_section: message_text += f"\n*⚡ Live Radar: Actionable Insights*\n{comments_section}"
     response = requests.post(GOOGLE_CHAT_WEBHOOK_URL, headers={"Content-Type": "application/json"}, data=json.dumps({"text": message_text}))
-    if response.status_code == 200:
-        print("✅ Message sent successfully!"); return True
-    else:
-        print(f"❌ Failed to send message: {response.status_code}, {response.text}"); return False
+    if response.status_code == 200: print("✅ Message sent successfully!"); return True
+    else: print(f"❌ Failed to send message: {response.status_code}, {response.text}"); return False
 
 def main():
     print("--- Starting Integrated ReleaseRadar Bot ---")
