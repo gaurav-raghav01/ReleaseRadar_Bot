@@ -2,311 +2,205 @@ import os
 import sys
 import json
 from datetime import datetime, timedelta, timezone
+import gspread
 import requests
-from requests.auth import HTTPBasicAuth
-
+from jira import JIRA
+from oauth2client.service_account import ServiceAccountCredentials
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
 # --- CONFIGURATION ---
-PROJECT_ID = "prj-s-ai-bot-4rl8" 
-LOCATION = "us-central1"  
+# These will be set by the GitHub Actions secrets and environment variables
+JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
+JIRA_EMAIL = os.getenv("JIRA_EMAIL")
+JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+JQL_QUERY = os.getenv("JQL_QUERY", 'worktype = Change AND assignee IN ("Gaurav Raghav", "Chandan Kumar", "Himanshu Mittal", "Kamaldeep Singh", "Rahul Dev Jha") AND "Planned start" >= startOfDay() AND "Planned start" <= endOfDay()')
+
+# Google Cloud & Sheets
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "prj-s-ai-bot-4rl8")
+GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+GOOGLE_SHEET_FILE_ID = os.getenv("GOOGLE_SHEET_FILE_ID", "1NwJd8uzGIcDTxE0XJ_VYbqJfQnjuqxB4wh5UR97SIlk") # Daily Sheet ID
+GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Daily Changes") # Your tab name
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./gcp_keys.json")
+
+# Google Chat
+GOOGLE_CHAT_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# SECURE CREDENTIALS via GitHub Actions Environment Variables
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-JIRA_URL = os.environ.get("JIRA_URL", "https://osttra.atlassian.net") 
-JIRA_EMAIL = os.environ.get("JIRA_EMAIL")  
-JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN")
+class JiraService:
+    def __init__(self, server, email, token):
+        self.client = None
+        try:
+            self.client = JIRA(server=server, basic_auth=(email, token))
+            print("✅ Successfully connected to Jira.")
+        except Exception as e:
+            print(f"❌ ERROR: Could not connect to Jira. {e}", file=sys.stderr)
+            sys.exit(1)
 
-# STATE FILES
-STATE_FILE = "jira_last_run_state.txt" 
-FIRST_RUN_FILE = "jira_first_run_state.txt" 
+    def get_planned_changes(self):
+        if not self.client: return []
+        try:
+            print(f"🔍 Querying Jira for today's planned changes...")
+            issues = self.client.search_issues(JQL_QUERY, maxResults=50, fields=['summary', 'status', 'assignee', 'description', 'comment'])
+            print(f" Jira found {len(issues)} planned ticket(s).")
+            return issues
+        except Exception as e:
+            print(f"❌ ERROR: Failed to query Jira. {e}", file=sys.stderr)
+            return []
 
-def get_today_deployments():
-    """Fetches today's planned Change tickets assigned to the team using Jira REST API v3."""
-    print("Authenticating and fetching tickets from Jira...")
-    
-    if not JIRA_API_TOKEN or not JIRA_EMAIL:
-        print("❌ CRITICAL ERROR: Jira credentials not found in environment variables!")
-        sys.exit(1)
+class GoogleSheetService:
+    def __init__(self, credentials_path, sheet_id, worksheet_name):
+        self.worksheet = None
+        try:
+            scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets', "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
+            gc = gspread.authorize(creds)
+            self.worksheet = gc.open_by_key(sheet_id).worksheet(worksheet_name)
+            print("✅ Successfully connected to Google Sheets.")
+        except Exception as e:
+            print(f"❌ ERROR: Could not connect to Google Sheets. Check permissions and names. {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def get_sheet_data_and_find_insertion_point(self):
+        all_values = self.worksheet.get_all_values()
+        today_str_long = datetime.now(IST).strftime("%d/%m/%Y")
+        today_str_short = datetime.now(IST).strftime("%d/%m/%y")
+
+        today_block_start_row = -1
+        next_block_start_row = -1
+
+        for i, row in enumerate(all_values):
+            if not row or not row[0]: continue
+            cell_content = row[0].strip()
+            
+            # Find the start of today's block
+            if today_str_long in cell_content or today_str_short in cell_content:
+                if today_block_start_row == -1: # Found the first occurrence
+                    today_block_start_row = i + 1
+            # Find the start of the next block
+            elif today_block_start_row != -1 and cell_content and ('/' in cell_content or '-' in cell_content):
+                 next_block_start_row = i + 1
+                 break
         
-    jql_query = """
-    worktype = Change 
-    AND assignee IN ("Gaurav Raghav", "Chandan Kumar", "Himanshu Mittal", "Kamaldeep Singh", "Rahul Dev Jha")
-    AND "Planned start" >= startOfDay() AND "Planned start" <= endOfDay()
-    """
-    
-    # FIXED: Added JIRA_URL variable to the path
-    url = f"{JIRA_URL}/rest/api/3/search/jql" 
-    auth = HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
-    
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        'jql': jql_query,
-        'maxResults': 50,
-        'fields': ['summary', 'status', 'assignee', 'description', 'environment', 'comment'] 
-    }
-    
-    response = None
-    try:
-        response = requests.post(url, headers=headers, json=payload, auth=auth)
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        # FIXED: Added exception details to the print statement
-        print(f"\n❌ CRITICAL ERROR: Failed to fetch data from Jira. Details: {e}")
-        if response is not None:
-            print(response.text)
-        sys.exit(1)
+        insertion_index = next_block_start_row if next_block_start_row != -1 else len(all_values) + 1
+        return all_values, today_block_start_row, insertion_index
 
-    issues = data.get('issues', [])
-    if not issues:
-        return []
-
-    today_deployments = []
-    for issue in issues:
-        fields = issue.get('fields', {})
-        assignee_dict = fields.get('assignee') or {}
-        status_dict = fields.get('status') or {}
+    def create_today_block_and_insert(self, rows_to_add):
+        print(f"No block found for today. Creating a new one...")
+        today_header = [datetime.now(IST).strftime("%d/%m/%Y")]
+        column_headers = ['Date', 'CR', 'Env', 'Application', 'Description', 'Implementer', 'Start Time', 'Status']
         
-        # Extract the latest comments to give Gemini context on current blockers/status
-        comment_data = fields.get('comment', {})
-        comments_list = comment_data.get('comments', [])
-        recent_comments = [c.get('body') for c in comments_list[-3:]]
+        self.worksheet.append_row([]) # Spacer row
+        self.worksheet.append_row(today_header)
+        self.worksheet.append_row(column_headers)
+        self.worksheet.append_rows(rows_to_add)
+
+    def insert_rows_at_index(self, rows_to_add, index):
+        self.worksheet.insert_rows(rows_to_add, row=index)
+
+class GeminiService:
+    def __init__(self, project_id, location):
+        vertexai.init(project=project_id, location=location)
+        self.model = GenerativeModel("gemini-1.5-flash-001") # Using Gemini 1.5 Flash
+        print("✅ Vertex AI (Gemini) service initialized.")
+
+    def analyze_jira_data(self, jira_issues):
+        deployments_for_prompt = []
+        for issue in jira_issues:
+            recent_comments = [c.body for c in (issue.fields.comment.comments or [])[-3:]]
+            deployments_for_prompt.append({
+                "ticket_key": issue.key, "summary": issue.fields.summary, "status": issue.fields.status.name,
+                "assignee": issue.fields.assignee.displayName if issue.fields.assignee else 'Unassigned',
+                "description": issue.fields.description, "recent_comments": recent_comments
+            })
+
+        prompt = f"""
+        Analyze this raw deployment data from Jira. Raw JSON Data: {json.dumps(deployments_for_prompt, indent=2)}
+        You are an intelligent Release Manager. Perform these tasks:
+        1. Write a 1-sentence "executive_summary" of today's deployment health.
+        2. For each ticket, analyze the description and recent_comments to create a "comments" field summarizing any blockers or notable updates. If none, leave it as an empty string.
+        3. Create a "short_desc" (MAX 3-5 words).
+        4. Deduce the "application" and "environment".
+        5. For "status", use the exact Jira status.
+        6. For "status_emoji", use ✅ (Done/Completed), ⚙️ (In Progress/Started), ⏳ (Pending/To Do), 🚧 (Backed Out/Failed/Cancelled).
         
-        dep_info = {
-            "ticket_key": issue.get('key'),
-            "summary": fields.get('summary'),
-            "status": status_dict.get('name', 'Unknown'),
-            "assignee": assignee_dict.get('displayName', 'Unassigned'),
-            "description": fields.get('description', ''),
-            "recent_comments": recent_comments 
-        }
-        today_deployments.append(dep_info)
-        
-    return today_deployments
-
-def are_all_tasks_completed(deployments):
-    """Checks if there are active tasks remaining based on Jira statuses."""
-    if not deployments:
-        return True 
-        
-    completed_statuses = ['done', 'completed', 'implemented successfully', 'closed', 'resolved', 'cancelled']
-    
-    for dep in deployments:
-        status = str(dep.get("status", "")).lower()
-        if status not in completed_statuses:
-            return False 
-    return True 
-
-def generate_data_with_gemini(deployments):
-    """Uses Gemini to extract structured JSON and perform AI Analysis from Jira data."""
-    print("Extracting data and analyzing updates with Gemini (Vertex AI)...")
-    
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-    model = GenerativeModel("gemini-2.5-flash") 
-    
-    prompt = f"""
-    Analyze this raw deployment data fetched directly from our Jira system.
-    Raw Jira JSON Data:
-    {json.dumps(deployments, indent=2)}
-    
-    You are an intelligent Release Manager. Do the following:
-    1. Extract the basic details for each deployment using the Jira summary, description, and status.
-    2. Write a 1-sentence "executive_summary" summarizing today's overall deployment health.
-    3. For "comments", analyze BOTH the `description` AND the `recent_comments`. Summarize any specific issues, blockers, failure reasons, or rollback notes. If there is nothing notable, leave it as "". DO NOT make up generic comments.
-    4. Create a "short_desc", which must be a condensed summary of the task (MAXIMUM 3 to 5 words, strictly under 20 characters).
-    5. Deduce the "application" and "environment" dynamically.
-    6. For "status", strictly output the EXACT state the ticket is currently in based on the raw JSON (e.g., "In Progress", "Backed Out", "Completed", "Pending", "Cancelled").
-    
-    OUTPUT FORMAT REQUIREMENTS:
-    Return strictly a valid JSON object. Do NOT wrap it in ```json markdown blocks.
-    The JSON must match this exact structure:
-    {{
-    "executive_summary": "A 1-sentence AI summary of today's deployments",
-    "deployments": [
-    {{
-    "change_no": "TRMPLATFORM-9498",
-    "application": "SocGen",
-    "short_desc": "Release 1.17.0",
-    "environment": "DR",
-    "implementer": "Kamaldeep",
-    "status": "In Progress", 
-    "status_emoji": "⚙️",
-    "comments": "Rollback steps verified. Blocked by DB team..."
-    }}
-    ]
-    }}
-    Note: For status_emoji use ✅ (Done/Completed), ⚙️ (In Progress/Started), ⏳ (Pending/To Do), 🚧 (Rescheduled/Failed/Backed Out/Cancelled).
-    """
-
-    response = model.generate_content(prompt)
-    response_text = response.text.strip()
-    
-    if response_text.startswith("```json"): response_text = response_text[7:]
-    if response_text.startswith("```"): response_text = response_text[3:]
-    if response_text.endswith("```"): response_text = response_text[:-3]
-        
-    try:
-        return json.loads(response_text.strip())
-    except json.JSONDecodeError as e:
-        print("❌ Failed to parse Gemini output into JSON.")
-        print(response_text)
-        return None
-
-def send_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
-    """Builds an ASCII table for Google Chat."""
-    if not card_data or "deployments" not in card_data:
-        return False
-
-    print("\nSending formatted message to Chat...")
-    
-    summary = card_data.get("executive_summary", "")
-    deployments = card_data["deployments"]
-
-    headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
-    rows = []
-    
-    for dep in deployments:
-        change_no = str(dep.get('change_no', 'N/A'))[:15] 
-        app = str(dep.get('application', 'N/A'))[:8]  
-        desc = str(dep.get('short_desc', 'N/A'))[:20]  
-        env = str(dep.get('environment', 'N/A'))[:6]  
-        status_emoji = dep.get('status_emoji', '⏳') 
-        owner_full = str(dep.get('implementer', 'N/A'))
-        owner = owner_full.split(" ")[0][:10] if " " in owner_full else owner_full[:10]  
-        
-        rows.append([change_no, app, desc, env, status_emoji, owner])
-
-    col_widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            display_length = len(cell) if not any(emoji in cell for emoji in ['✅','⚙️','⏳','🚧']) else len(cell) - 1
-            col_widths[i] = max(col_widths[i], display_length)
-
-    header_line = "| " + " | ".join(h.ljust(w) for h, w in zip(headers, col_widths)) + " |"
-    separator_line = "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"
-    
-    table_lines = [header_line, separator_line]
-    for row in rows:
-        row_line = "|"
-        for i, cell in enumerate(row):
-            if i == 4: 
-                row_line += f" " + (" " * (col_widths[i] - 1)) + f"{cell}|"
-            else:
-                row_line += f" {cell.ljust(col_widths[i])} |"
-        table_lines.append(row_line)
-
-    table_content = "\n".join(table_lines)
-
-    comments_section = ""
-    for dep in deployments:
-        key = dep.get('change_no', 'N/A')
-        status = dep.get('status', 'Unknown')
-        c = dep.get("comments", "").strip()
-        is_done = ("done" in status.lower() or "completed" in status.lower() or dep.get("status_emoji") == "✅")
-        
-        # Only show comments/blockers for incomplete tasks
-        if not is_done and c and c.lower() not in ["none", "-", "n/a", "null", ""]:
-            # FIXED: Properly formatting Jira hyperlinking and comment injection
-            jira_link = f"<{JIRA_URL}/browse/{key}|{key}>"
-            comments_section += f"• **{jira_link}**: {c}\n"
-
-    # FIXED TIMEZONE HERE
-    today_date = datetime.now(IST).strftime('%d/%m/%Y')
-    
-    # FIXED: Added today_date variable to headers
-    if is_wrap_up:
-        message_text = f"*🎉 Wrap-up Update - Planned Changes for Today ({today_date}) (JIRA Radar)*\n\n"
-    elif is_first_update:
-        message_text = f"*Hi All, Planned Changes for Today ({today_date}) (JIRA Radar)*\n\n"
-    else:
-        message_text = f"*Hi All, Update - Planned Changes for Today ({today_date}) (JIRA Radar)*\n\n"
-        
-    if summary:
-        message_text += f"🤖 *AI Summary:* {summary}\n\n"
-        
-    # FIXED: Added table_content to the code block
-    message_text += f"```\n{table_content}\n```\n"
-    message_text += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚧 Backed Out/Failed/Rescheduled)*\n"
-
-    # FIXED: Now injects the 'comments_section' string!
-    if comments_section:
-        message_text += f"\n*⚡ Live Radar: Actionable Insights & Friction Points*\n{comments_section}"
-
-    payload = {"text": message_text}
-    headers_req = {"Content-Type": "application/json"}
-    
-    response = requests.post(WEBHOOK_URL, headers=headers_req, data=json.dumps(payload))
-    if response.status_code == 200:
-        print("✅ TABLE message sent successfully to Chat Space!")
-        return True
-    else:
-        print(f"❌ Failed to send message: {response.status_code}, {response.text}")
-        return False
+        OUTPUT FORMAT REQUIREMENTS: Return ONLY a valid JSON object. Do not use markdown.
+        {{
+        "executive_summary": "...",
+        "deployments": [
+            {{
+            "change_no": "...", "application": "...", "short_desc": "...", "environment": "...",
+            "implementer": "...", "status": "...", "status_emoji": "...", "comments": "..."
+            }}
+        ]
+        }}
+        """
+        try:
+            response = self.model.generate_content(prompt)
+            # Clean the response text to ensure it's valid JSON
+            cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
+            return json.loads(cleaned_text)
+        except Exception as e:
+            print(f"❌ ERROR: Failed to get or parse Gemini response. {e}", file=sys.stderr)
+            return None
 
 def main():
-    try:
-        today_deployments = get_today_deployments()
-        
-        if not today_deployments:
-            print("No deployments found for today in Jira. Exiting.")
-            sys.exit(0)
+    print("--- Starting Integrated ReleaseRadar Bot ---")
+    
+    # 1. Initialize Services
+    jira = JiraService(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN)
+    sheets = GoogleSheetService(GOOGLE_CREDENTIALS_PATH, GOOGLE_SHEET_FILE_ID, GOOGLE_WORKSHEET_NAME)
+    gemini = GeminiService(GCP_PROJECT_ID, GCP_LOCATION)
+    
+    # 2. Get tickets from Jira
+    jira_tickets = jira.get_planned_changes()
+    if not jira_tickets:
+        print("No planned changes found in Jira for today. Exiting.")
+        return
 
-        now_ist = datetime.now(IST)
-        is_finished = are_all_tasks_completed(today_deployments)
-        is_deadline_reached = now_ist.hour >= 21
+    # 3. Find where to insert data in the Google Sheet
+    all_sheet_values, today_block_row, insertion_index = sheets.get_sheet_data_and_find_insertion_point()
+    
+    # 4. De-duplicate: Find tickets from Jira that are NOT already in the sheet
+    existing_keys = {row[1].strip() for row in all_sheet_values if len(row) > 1 and row[1]}
+    new_tickets = [t for t in jira_tickets if t.key not in existing_keys]
 
-        today_str = now_ist.strftime('%Y-%m-%d')
+    # 5. Prepare and insert/append new rows if any
+    rows_to_add = []
+    if new_tickets:
+        for ticket in new_tickets:
+            # This is the data that gets written to the sheet
+            row_data = [
+                datetime.now(IST).strftime("%d/%m/%Y"), ticket.key,
+                'PROD' if 'prod' in ticket.fields.summary.lower() else 'UAT',
+                '', # Application
+                ticket.fields.summary,
+                ticket.fields.assignee.displayName if ticket.fields.assignee else 'Unassigned',
+                '', # Start Time
+                ticket.fields.status.name
+            ]
+            rows_to_add.append(row_data)
 
-        # SAFELY INITIALIZE STATE FILES
-        if not os.path.exists(FIRST_RUN_FILE): open(FIRST_RUN_FILE, 'w').close()
-        if not os.path.exists(STATE_FILE): open(STATE_FILE, 'w').close()
-
-        is_first_run = True
-        with open(FIRST_RUN_FILE, "r") as f:
-            if f.read().strip() == today_str:
-                is_first_run = False
-
-        if is_finished or is_deadline_reached:
-            with open(STATE_FILE, "r") as f:
-                if f.read().strip() == today_str:
-                    print("✅ Wrap-up update was already completed today. Exiting.")
-                    sys.exit(0)
-            
-            if is_deadline_reached and not is_finished:
-                print("🕒 21:00 IST reached with pending tasks. Forcing final wrap-up summary...")
-            else:
-                print("🎉 All deployments completed! Sending final wrap-up summary...")
-                
-            card_data = generate_data_with_gemini(today_deployments)
-            if card_data:
-                success = send_to_gchat(card_data, is_first_update=is_first_run, is_wrap_up=True)
-                if success:
-                    with open(STATE_FILE, "w") as f:
-                        f.write(today_str)
-                    if is_first_run:
-                        with open(FIRST_RUN_FILE, "w") as f:
-                            f.write(today_str)
+        if today_block_row == -1:
+            sheets.create_today_block_and_insert(rows_to_add)
         else:
-            with open(STATE_FILE, "w") as f:
-                f.write("") # Clear out the final state so it knows it isn't wrapped up yet
+            print(f"Inserting {len(rows_to_add)} new row(s) at sheet row {insertion_index}...")
+            sheets.insert_rows_at_index(rows_to_add, insertion_index)
+    else:
+        print("✅ Google Sheet is already up-to-date with Jira tickets.")
 
-            card_data = generate_data_with_gemini(today_deployments)
-            if card_data:
-                success = send_to_gchat(card_data, is_first_update=is_first_run, is_wrap_up=False)
-                if success and is_first_run:
-                    with open(FIRST_RUN_FILE, "w") as f:
-                        f.write(today_str)
-        
-    except Exception as e:
-        # FIXED: Catching the actual exception message
-        print(f"An error occurred: {e}")
+    # 6. Use Gemini to analyze the complete list of today's tickets for chat reporting
+    gemini_analysis = gemini.analyze_jira_data(jira_tickets)
+
+    # 7. Send the update to Google Chat
+    if gemini_analysis and GOOGLE_CHAT_WEBHOOK_URL:
+        # Use the logic from your original jira_deployment_bot to send chat
+        from jira_deployment_bot import send_to_gchat 
+        send_to_gchat(gemini_analysis, is_first_update=True, is_wrap_up=False)
+    else:
+        print("Skipping Google Chat notification (no data from Gemini or webhook URL not set).")
 
 if __name__ == "__main__":
     main()
+

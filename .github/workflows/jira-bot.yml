@@ -1,18 +1,16 @@
-name: Jira Deployment Bot
+name: ReleaseRadar Bot - Integrated
 
 on:
-  #schedule:
-    # Staggered by 5 mins to prevent Git push conflicts with the Sheets bot
-    # Runs at 9:05, 11:05, 13:05, 15:05, 17:05, 19:05, 21:05 IST
-    # - cron: '35 3,5,7,9,11,13,15 * * *'
-    
-  workflow_dispatch: {} # Explicit empty object prevents YAML linter errors for UI triggers
+  schedule:
+    # Runs every 30 minutes on weekdays (IST) during business hours
+    - cron: '*/30 3-14 * * 1-5'
+  workflow_dispatch: {} # Allows manual runs
 
 jobs:
-  jira-tracker:
+  run-release-radar:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Required for auto-commit
+      contents: read # No longer needs to write back to the repo
 
     steps:
       - name: Checkout Code
@@ -26,25 +24,20 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install google-auth google-api-python-client vertexai requests
+          pip install gspread oauth2client jira-python requests google-auth google-api-python-client vertexai
 
       - name: Inject GCP Credentials
-        # Securely maps multi-line JSON secret to env var to prevent Bash string syntax errors
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
-        run: |
-          echo "$GCP_CREDENTIALS" > gcp_keys.json
+        run: echo "$GCP_CREDENTIALS" > gcp_keys.json
 
-      - name: Run Jira Bot
+      - name: Run Integrated ReleaseRadar Bot
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json 
-          WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }}
+          # Secrets from GitHub repository settings
+          WEBHOOK_URL: ${{ secrets.PROD_GC_WEBHOOK_URL }} # Or your test webhook
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-        run: python jira_deployment_bot.py
-
-      - name: Save Jira State Files (Auto-Commit)
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: update jira bot state"
-          file_pattern: "jira_*.txt" # Only commits Jira state files
+          
+          # This tells the SDK where to find the key file
+          GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
+        run: python release_radar_integrated.py
