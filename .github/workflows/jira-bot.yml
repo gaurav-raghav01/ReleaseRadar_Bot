@@ -40,4 +40,4 @@ jobs:
           
           # This tells the SDK where to find the key file
           GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
-        run: python release_radar_integrated.py
+        run: python jira_deployment_bot.py
