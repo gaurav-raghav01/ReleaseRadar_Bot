@@ -10,7 +10,7 @@ jobs:
   run-release-radar:
     runs-on: ubuntu-latest
     permissions:
-      contents: read # No longer needs to write back to the repo
+      contents: read
 
     steps:
       - name: Checkout Code
@@ -24,7 +24,11 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install gspread oauth2client jira-python requests google-auth google-api-python-client vertexai
+          # --- THE FIX IS HERE ---
+          # Force uninstall the wrong 'jira-python' library first
+          pip uninstall -y jira-python
+          # Now, install the correct libraries
+          pip install gspread oauth2client jira requests google-auth google-api-python-client vertexai
 
       - name: Inject GCP Credentials
         env:
@@ -32,12 +36,10 @@ jobs:
         run: echo "$GCP_CREDENTIALS" > gcp_keys.json
 
       - name: Run Integrated ReleaseRadar Bot
+        # --- IMPORTANT: Change this to run the correct, single script ---
         env:
-          # Secrets from GitHub repository settings
-          WEBHOOK_URL: ${{ secrets.PROD_GC_WEBHOOK_URL }} # Or your test webhook
+          WEBHOOK_URL: ${{ secrets.PROD_GC_WEBHOOK_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          
-          # This tells the SDK where to find the key file
           GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
-        run: python jira_deployment_bot.py
+        run: python jira_deployment_bot.py # Use the new integrated script
