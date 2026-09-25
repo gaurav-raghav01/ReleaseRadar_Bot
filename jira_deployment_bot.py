@@ -17,7 +17,6 @@ JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
-# Precise JQL matching your team for today
 JQL_QUERY = os.getenv(
     "JQL_QUERY",
     """
@@ -38,7 +37,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 IST = timezone(timedelta(hours=5, minutes=30))
 
 DONE_STATUSES = {"done", "completed", "closed", "resolved", "implemented successfully", "success"}
-IN_PROGRESS_STATUSES = {"in progress", "work in progress", "implementing", "started"}
+IN_PROGRESS_STATUSES = {"in progress", "work in progress", "implementing", "started", "awaiting implementation"}
 
 # ==============================================================================
 # JIRA SERVICE
@@ -71,7 +70,7 @@ class JiraService:
             return []
 
 # ==============================================================================
-# GOOGLE SHEETS SERVICE WITH FORMATTING SUPPORT
+# GOOGLE SHEETS SERVICE WITH CLEAN FORMATTING & MANUAL PRIORITY
 # ==============================================================================
 class GoogleSheetService:
     def __init__(self, spreadsheet_id, sheet_name):
@@ -105,14 +104,6 @@ class GoogleSheetService:
         ).execute()
         return res.get('values', [])
 
-    def update_range(self, cell_range, values):
-        self.service.spreadsheets().values().update(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"'{self.sheet_name}'!{cell_range}",
-            valueInputOption='USER_ENTERED',
-            body={'values': values}
-        ).execute()
-
     def append_rows(self, rows_data):
         range_name = f"'{self.sheet_name}'!A:A"
         res = self.service.spreadsheets().values().append(
@@ -128,7 +119,7 @@ class GoogleSheetService:
         start_0 = start_row_index_1_based - 1
         num_rows = len(rows_data)
         
-        # 1. Insert blank rows
+        # Insert blank rows
         body = {
             "requests": [
                 {
@@ -148,19 +139,27 @@ class GoogleSheetService:
             spreadsheetId=self.spreadsheet_id, body=body
         ).execute()
 
-        # 2. Write values
-        self.update_range(f"A{start_row_index_1_based}", rows_data)
-        
-        # 3. Apply cell styling (borders and dropdown styling)
-        self.format_data_rows(start_row_index_1_based, start_row_index_1_based + num_rows - 1)
+        # Write values
+        self.service.spreadsheets().values().update(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"'{self.sheet_name}'!A{start_row_index_1_based}",
+            valueInputOption='USER_ENTERED',
+            body={'values': rows_data}
+        ).execute()
 
-    def find_insertion_point_and_statuses(self, all_values):
+    def parse_sheet_for_today(self, all_values):
+        """
+        Reads existing sheet state. Identifies:
+        1. Where today's block is located.
+        2. All existing tickets logged in today's block (including manually added ones).
+        3. Their exact manual statuses, implementors, and descriptions.
+        """
         today_str = datetime.now(IST).strftime("%d/%m/%Y")
         today_str_alt = datetime.now(IST).strftime("%d/%m/%y")
 
         today_block_start = -1
         next_block_start = -1
-        sheet_ticket_statuses = {}  # {ticket_key: status_str}
+        existing_today_tickets = {}  # {key: {"row_idx": i, "env": ..., "status": ..., "desc": ..., "owner": ...}}
 
         for idx, row in enumerate(all_values):
             if not row or not row[0]:
@@ -174,37 +173,46 @@ class GoogleSheetService:
                 next_block_start = idx + 1
                 break
 
-            # If inside today's block, track ticket statuses from Column B (CR) & Column I (Status)
             if today_block_start != -1 and len(row) > 1 and row[1]:
                 t_key = row[1].strip()
-                t_status = row[8].strip() if len(row) > 8 else ""
-                sheet_ticket_statuses[t_key] = t_status
+                if t_key not in ["CR", "Change"]:
+                    existing_today_tickets[t_key] = {
+                        "row": idx + 1,
+                        "env": row[2].strip() if len(row) > 2 else "",
+                        "type": row[3].strip() if len(row) > 3 else "",
+                        "app": row[4].strip() if len(row) > 4 else "",
+                        "desc": row[5].strip() if len(row) > 5 else "",
+                        "owner": row[6].strip() if len(row) > 6 else "",
+                        "status": row[8].strip() if len(row) > 8 else ""
+                    }
 
         insertion_index = next_block_start if next_block_start != -1 else len(all_values) + 1
-        return today_block_start, insertion_index, sheet_ticket_statuses
+        return today_block_start, insertion_index, existing_today_tickets
 
-    def create_styled_today_block(self, rows_to_add, start_row_1_based):
+    def create_clean_today_block(self, rows_to_add, start_row_1_based):
         """
-        Creates the complete colorful date banner, headers, and rows with matching borders & colors.
+        Creates today's block:
+        1. Date separator banner with NO dropdowns.
+        2. Column header row (Dark Navy, bold white text) with NO dropdowns.
+        3. Data rows with grid styling.
         """
         today_str = datetime.now(IST).strftime("%d/%m/%Y")
         all_block_rows = [
-            [], # Empty spacer
-            [today_str] + [""] * 8, # Date banner row
-            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status']
+            [], # Blank spacer row
+            [today_str] + [""] * 8, # Row 300: Banner
+            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status'] # Row 301: Headers
         ] + rows_to_add
 
-        # 1. Append values
+        # 1. Append the rows
         self.append_rows(all_block_rows)
 
-        banner_row_1 = start_row_1_based + 1
-        header_row_1 = start_row_1_based + 2
-        data_start_row_1 = start_row_1_based + 3
+        banner_row_1 = start_row_1_based + 2   # Row 300
+        header_row_1 = start_row_1_based + 3   # Row 301
+        data_start_row_1 = start_row_1_based + 4
         data_end_row_1 = data_start_row_1 + len(rows_to_add) - 1
 
-        # 2. Batch format request: Merge banner, apply colors, borders, font weights
         requests_list = [
-            # A. Merge Date Banner (Col A to I)
+            # A. MERGE Banner across Col A (0) to Col I (9)
             {
                 "mergeCells": {
                     "range": {
@@ -217,7 +225,7 @@ class GoogleSheetService:
                     "mergeType": "MERGE_ALL"
                 }
             },
-            # B. Format Date Banner (Light Blue fill, Bold Text, Centered)
+            # B. Style Banner (Light Blue #4a86e8, Centered, Bold White, Font Size 10)
             {
                 "repeatCell": {
                     "range": {
@@ -229,15 +237,29 @@ class GoogleSheetService:
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.44, "green": 0.71, "blue": 0.98}, # #70b5f9
-                            "textFormat": {"bold": True, "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}, "fontSize": 10},
-                            "horizontalAlignment": "CENTER"
+                            "backgroundColor": {"red": 0.29, "green": 0.53, "blue": 0.91},
+                            "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "fontSize": 10},
+                            "horizontalAlignment": "LEFT",
+                            "verticalAlignment": "MIDDLE"
                         }
                     },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # C. Format Column Headers (Dark Navy fill, White Bold Text)
+            # C. REMOVE ALL DROPDOWNS from Banner Row (Clear Data Validation)
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": self.sheet_id_num,
+                        "startRowIndex": banner_row_1 - 1,
+                        "endRowIndex": banner_row_1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 9
+                    },
+                    "rule": None
+                }
+            },
+            # D. Style Column Header Row (Dark Navy #0b5394, Bold White text)
             {
                 "repeatCell": {
                     "range": {
@@ -249,32 +271,43 @@ class GoogleSheetService:
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.09, "green": 0.45, "blue": 0.91}, # #1773e8
+                            "backgroundColor": {"red": 0.04, "green": 0.33, "blue": 0.58}, # #0b5394
                             "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "fontSize": 9},
-                            "horizontalAlignment": "CENTER"
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE"
                         }
                     },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
+                }
+            },
+            # E. REMOVE ALL DROPDOWNS from Column Header Row
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": self.sheet_id_num,
+                        "startRowIndex": header_row_1 - 1,
+                        "endRowIndex": header_row_1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 9
+                    },
+                    "rule": None
                 }
             }
         ]
 
-        # Apply borders and formats
         self.service.spreadsheets().batchUpdate(
-            spreadsheetId=self.spreadsheet_id,
-            body={"requests": requests_list}
+            spreadsheetId=self.spreadsheet_id, body={"requests": requests_list}
         ).execute()
 
-        # Apply borders to data rows
-        self.format_data_rows(data_start_row_1, data_end_row_1)
-        print("🎨 Successfully styled today's block with matching colors and headers!")
+        # Apply solid grid borders to newly appended data rows
+        self.format_borders(data_start_row_1, data_end_row_1)
+        print("🎨 Cleaned block: Dropdowns removed from Banner & Headers. Navy theme applied!")
 
-    def format_data_rows(self, start_row_1, end_row_1):
-        """Applies grid borders and alignments to data rows."""
+    def format_borders(self, start_row_1, end_row_1):
         border_spec = {
             "style": "SOLID",
             "width": 1,
-            "color": {"red": 0.8, "green": 0.8, "blue": 0.8}
+            "color": {"red": 0.85, "green": 0.85, "blue": 0.85}
         }
         body = {
             "requests": [
@@ -299,23 +332,24 @@ class GoogleSheetService:
         ).execute()
 
 # ==============================================================================
-# STATUS PARITY LOGIC
+# STATUS PARITY LOGIC (MANUAL SHEET EDITS ALWAYS PERSIST & WIN)
 # ==============================================================================
-def resolve_parity_status(jira_status, sheet_status):
+def resolve_parity(sheet_data, jira_ticket):
     """
-    Parity Rule:
-    - If either Sheet OR Jira says Done/Completed -> Done (✅)
-    - Else if either is In Progress -> In Progress (⚙️)
-    - Else -> Pending (⏳)
+    Priority Rules:
+    1. If manually marked in the Sheet, the Sheet's status WINS.
+    2. If either Sheet OR Jira is Done -> Done (✅)
+    3. If either is In Progress -> In Progress (⚙️)
+    4. Otherwise -> Pending (⏳)
     """
-    j_stat = (jira_status or "").strip().lower()
-    s_stat = (sheet_status or "").strip().lower()
+    s_status = (sheet_data.get("status") if sheet_data else "").strip().lower()
+    j_status = (jira_ticket.fields.status.name if jira_ticket else "").strip().lower()
 
-    if s_stat in DONE_STATUSES or j_stat in DONE_STATUSES:
+    if s_status in DONE_STATUSES or j_status in DONE_STATUSES:
         return "Done", "✅"
-    elif s_stat in IN_PROGRESS_STATUSES or j_stat in IN_PROGRESS_STATUSES:
+    elif s_status in IN_PROGRESS_STATUSES or j_status in IN_PROGRESS_STATUSES:
         return "In Progress", "⚙️"
-    elif "fail" in s_stat or "fail" in j_stat or "back" in s_stat or "back" in j_stat:
+    elif "fail" in s_status or "fail" in j_status or "back" in s_status or "back" in j_status:
         return "Failed/Backed Out", "🚧"
     else:
         return "Pending", "⏳"
@@ -329,40 +363,19 @@ class GeminiService:
         self.model = GenerativeModel("gemini-2.5-flash")
         print("✅ Vertex AI (Gemini 2.5 Flash) initialized.")
 
-    def analyze_jira_data(self, jira_issues, sheet_statuses):
-        deployments = []
-        for issue in jira_issues:
-            fields = issue.fields
-            comments = [c.body for c in (fields.comment.comments or [])[-3:]]
-            assignee = fields.assignee.displayName if fields.assignee else "Unassigned"
-            
-            # Apply Status Parity Rule
-            sheet_stat = sheet_statuses.get(issue.key, "")
-            effective_status, effective_emoji = resolve_parity_status(fields.status.name, sheet_stat)
-
-            deployments.append({
-                "ticket_key": issue.key,
-                "summary": fields.summary,
-                "jira_status": fields.status.name,
-                "sheet_status": sheet_stat,
-                "effective_status": effective_status,
-                "effective_emoji": effective_emoji,
-                "assignee": assignee,
-                "description": fields.description or "",
-                "recent_comments": comments
-            })
-
+    def analyze_unified_deployments(self, unified_list):
         prompt = f"""
-        Analyze this raw deployment data fetched directly from Jira with live sheet status overrides.
+        Analyze this raw deployment data from our Deployment Tracker (combination of Jira and manual Sheet entries).
         Data:
-        {json.dumps(deployments, indent=2)}
+        {json.dumps(unified_list, indent=2)}
 
         You are an intelligent Release Manager. Do the following:
         1. Write a 1-sentence "executive_summary" summarizing today's overall deployment health.
-        2. For "comments", analyze description and recent_comments for issues/blockers. If none, leave "".
+        2. For "comments", analyze description and recent comments for issues/blockers. If none, leave "".
         3. Create a "short_desc" (MAX 3 to 5 words, strictly under 20 characters).
         4. Deduce the "application" and "environment".
-        5. Respect the given "effective_status" and "effective_emoji" in the input!
+        5. For "status", strictly use the provided "effective_status".
+        6. For "status_emoji", strictly use the provided "effective_emoji".
 
         OUTPUT STRICT VALID JSON ONLY (No markdown):
         {{
@@ -453,7 +466,7 @@ def send_to_gchat(card_data):
 
     resp = requests.post(WEBHOOK_URL, headers={"Content-Type": "application/json"}, data=json.dumps({"text": msg}))
     if resp.status_code == 200:
-        print("✅ Google Chat update broadcasted successfully with parity!")
+        print("✅ Google Chat update broadcasted successfully!")
     else:
         print(f"❌ Chat post failed: {resp.status_code}, {resp.text}")
 
@@ -468,28 +481,27 @@ def main():
     gemini = GeminiService(GCP_PROJECT_ID, GCP_LOCATION)
 
     jira_tickets = jira.get_planned_changes()
-    if not jira_tickets:
-        print("No planned changes found in Jira for today. Exiting.")
-        return
 
-    # 1. Read sheet to inspect existing entries and current Sheet statuses
+    # 1. Inspect existing sheet data
     all_values = sheets.get_all_values()
-    today_block_row, insertion_idx, sheet_statuses = sheets.find_insertion_point_and_statuses(all_values)
+    today_block_row, insertion_idx, existing_sheet_tickets = sheets.parse_sheet_for_today(all_values)
 
-    existing_keys = set(sheet_statuses.keys())
-    for row in all_values:
-        for cell in row:
-            for issue in jira_tickets:
-                if issue.key in str(cell):
-                    existing_keys.add(issue.key)
+    print(f"[Tracker State] Today's block row: {today_block_row}. Existing tickets in block: {list(existing_sheet_tickets.keys())}")
 
-    new_tickets = [t for t in jira_tickets if t.key not in existing_keys]
-    print(f"[Sync] {len(existing_keys)} tickets in sheet. {len(new_tickets)} new ticket(s) to add.")
+    # 2. De-duplication: ONLY add tickets that do NOT exist in the sheet
+    new_tickets_to_add = []
+    jira_dict = {}
+    for t in jira_tickets:
+        jira_dict[t.key] = t
+        if t.key not in existing_sheet_tickets:
+            new_tickets_to_add.append(t)
 
-    # 2. Append/Insert new tickets with styling if needed
-    if new_tickets:
+    print(f"[Sync] {len(existing_sheet_tickets)} tickets already in sheet (PERSISTED). {len(new_tickets_to_add)} new Jira ticket(s) to add.")
+
+    # 3. Add new tickets if necessary
+    if new_tickets_to_add:
         rows_to_add = []
-        for t in new_tickets:
+        for t in new_tickets_to_add:
             summary = t.fields.summary
             env = "PROD" if "prod" in summary.lower() else "UAT"
             assignee = t.fields.assignee.displayName if t.fields.assignee else "Unassigned"
@@ -506,17 +518,48 @@ def main():
             ])
 
         if today_block_row == -1:
-            print("Today's block does not exist. Creating styled block with headers...")
-            current_row_count = len(all_values)
-            sheets.create_styled_today_block(rows_to_add, current_row_count)
+            print("Creating brand new styled block (No dropdowns on headers, Navy theme)...")
+            sheets.create_clean_today_block(rows_to_add, len(all_values))
         else:
-            print(f"Inserting into today's active block at row {insertion_idx}...")
+            print(f"Inserting {len(rows_to_add)} new row(s) at line {insertion_idx} (never overwrites manual rows)...")
             sheets.insert_rows_at(rows_to_add, insertion_idx)
     else:
-        print("✅ Sheet is already up-to-date with Jira tickets.")
+        print("✅ No new tickets to insert. All existing manual entries and statuses are untouched.")
 
-    # 3. Analyze with Gemini using the Sheet-Priority Parity Rule
-    analysis = gemini.analyze_jira_data(jira_tickets, sheet_statuses)
+    # 4. Prepare Unified Deployment List for Gemini & Google Chat
+    # Combine: (A) Sheet entries (with manual edits prioritized) + (B) Jira comments/context
+    unified_list = []
+    all_active_keys = set(existing_sheet_tickets.keys()) | set(jira_dict.keys())
+
+    for key in all_active_keys:
+        s_data = existing_sheet_tickets.get(key)
+        j_data = jira_dict.get(key)
+
+        effective_status, effective_emoji = resolve_parity(s_data, j_data)
+
+        # Manual sheet values take priority over Jira for display
+        desc = s_data.get("desc") if (s_data and s_data.get("desc")) else (j_data.fields.summary if j_data else key)
+        owner = s_data.get("owner") if (s_data and s_data.get("owner")) else (j_data.fields.assignee.displayName if j_data and j_data.fields.assignee else "TOC")
+        env = s_data.get("env") if (s_data and s_data.get("env")) else ("PROD" if "prod" in desc.lower() else "UAT")
+        app = s_data.get("app") if (s_data and s_data.get("app")) else ""
+
+        comments = []
+        if j_data and hasattr(j_data.fields, 'comment') and j_data.fields.comment:
+            comments = [c.body for c in (j_data.fields.comment.comments or [])[-3:]]
+
+        unified_list.append({
+            "ticket_key": key,
+            "summary": desc,
+            "application": app,
+            "environment": env,
+            "assignee": owner,
+            "effective_status": effective_status,
+            "effective_emoji": effective_emoji,
+            "recent_comments": comments
+        })
+
+    # 5. Broadcast to Google Chat
+    analysis = gemini.analyze_unified_deployments(unified_list)
     if analysis:
         send_to_gchat(analysis)
 
