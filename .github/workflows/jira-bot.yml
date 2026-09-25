@@ -26,20 +26,15 @@ jobs:
           pip uninstall -y jira-python
           pip install gspread jira requests google-auth google-api-python-client vertexai
 
-      # --- THIS IS THE CORRECT METHOD FOR YOUR CREDENTIALS ---
       - name: Inject GCP Credentials
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
         run: echo "$GCP_CREDENTIALS" > gcp_keys.json
-      # --- End of Fix ---
 
-      - name: Run Integrated ReleaseRadar Bot
+      - name: Run Jira Deployment Bot
         env:
-          # This tells all Google libraries to use the file we just created
           GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
-          
-          # Other secrets
-          WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }} # Using the non-prod webhook for testing
+          WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: python jira_deployment_bot.py
