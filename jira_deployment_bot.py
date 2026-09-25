@@ -18,7 +18,7 @@ JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JQL_QUERY = os.getenv(
     "JQL_QUERY",
-    'worktype = Change AND assignee IN ("Gaurav Raghav", "Chandan Kumar", "Himanshu Mittal", "Kamaldeep Singh", "Rahul Dev Jha") AND "Planned start" >= startOfDay() AND "Planned start" <= endOfDay()'
+    '(worktype = Change OR issuetype = Change) AND assignee IN ("Gaurav Raghav", "Chandan Kumar", "Kamaldeep Singh", "Rahul Dev Jha", 712020:b0badaa4-1a98-499f-9a5c-893ddaa5ccbe) AND "Planned start" >= startOfDay() AND "Planned start" <= endOfDay() ORDER BY "Planned start" ASC'
 )
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "prj-s-ai-bot-4rl8")
