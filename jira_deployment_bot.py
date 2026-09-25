@@ -39,8 +39,18 @@ IST = timezone(timedelta(hours=5, minutes=30))
 DONE_STATUSES = {"done", "completed", "closed", "resolved", "implemented successfully", "success"}
 IN_PROGRESS_STATUSES = {"in progress", "work in progress", "implementing", "started", "awaiting implementation"}
 
+# Known dropdown options in your Google Sheet (from input_file_22.png)
+KNOWN_APPS = [
+    "IC SA", "TradeSTP", "DealHub", "LimitHub", "MW", "OTM", "TN", "Transformers",
+    "STPaaS", "FXBA", "Traiana", "Adapter", "CCPC", "JSW", "H5/CL", "CRDS", "H3",
+    "DNM", "SSO", "CSM", "CFD", "ODC", "EQ", "Cashflow", "LH", "CreditLink",
+    "SocGen", "SCB", "ETD", "Baton", "AAS", "DMS", "SIGMA", "HSBC TRM", "IC LH UI",
+    "Alpine", "CITI TRM", "Apigee", "Jigsaw", "DB TRM", "BOFA TRM", "CFS", "JPTRM",
+    "NextGen Citi", "UBS", "ZKB", "BNPP", "3C", "WFM", "H4", "CLFX"
+]
+
 # ==============================================================================
-# JIRA SERVICE
+# JIRA SERVICE (WITH DYNAMIC AFFECTED SERVICES EXTRACTION)
 # ==============================================================================
 class JiraService:
     def __init__(self, server, email, token):
@@ -55,13 +65,61 @@ class JiraService:
             print(f"❌ ERROR: Could not connect to Jira: {e}", file=sys.stderr)
             sys.exit(1)
 
+    def extract_affected_service(self, issue):
+        """
+        Extracts the 'Affected services' field from Jira issue data.
+        Falls back to summary inspection matching your sheet's dropdowns.
+        """
+        raw_fields = issue.raw.get('fields', {})
+
+        # 1. Direct standard field check
+        for attr in ['services', 'affectedServices', 'components']:
+            val = raw_fields.get(attr)
+            if val and isinstance(val, list):
+                for item in val:
+                    name = item.get('name') if isinstance(item, dict) else str(item)
+                    if name:
+                        for app in KNOWN_APPS:
+                            if app.lower() == name.lower():
+                                return app
+                        return name
+
+        # 2. Iterate all custom fields to find the 'Affected services' object
+        for k, v in raw_fields.items():
+            if not v:
+                continue
+            # Look inside list of dicts (standard for service management assets)
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        name = item.get('name') or item.get('value')
+                        if name:
+                            for app in KNOWN_APPS:
+                                if app.lower() == str(name).lower():
+                                    return app
+            # Look inside single dict
+            elif isinstance(v, dict):
+                name = v.get('name') or v.get('value')
+                if name:
+                    for app in KNOWN_APPS:
+                        if app.lower() == str(name).lower():
+                            return app
+
+        # 3. Fallback: Deduce from Summary or Description
+        text = (issue.fields.summary or "") + " " + (issue.fields.description or "")
+        for app in KNOWN_APPS:
+            if f" {app.lower()} " in f" {text.lower()} " or app.lower() in text.lower():
+                return app
+
+        return ""
+
     def get_planned_changes(self):
         try:
             print("🔍 Querying Jira for today's planned changes...")
             issues = self.client.search_issues(
                 JQL_QUERY,
                 maxResults=50,
-                fields=['summary', 'status', 'assignee', 'description', 'comment']
+                fields=['*all']  # Fetch all custom fields so Affected Services is included
             )
             print(f" Jira found {len(issues)} planned ticket(s).")
             return issues
@@ -70,7 +128,7 @@ class JiraService:
             return []
 
 # ==============================================================================
-# GOOGLE SHEETS SERVICE WITH CLEAN FORMATTING & MANUAL PRIORITY
+# GOOGLE SHEETS SERVICE WITH CLEAN FORMATTING & HYPERLINKING
 # ==============================================================================
 class GoogleSheetService:
     def __init__(self, spreadsheet_id, sheet_name):
@@ -118,8 +176,7 @@ class GoogleSheetService:
     def insert_rows_at(self, rows_data, start_row_index_1_based):
         start_0 = start_row_index_1_based - 1
         num_rows = len(rows_data)
-        
-        # Insert blank rows
+
         body = {
             "requests": [
                 {
@@ -139,7 +196,6 @@ class GoogleSheetService:
             spreadsheetId=self.spreadsheet_id, body=body
         ).execute()
 
-        # Write values
         self.service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
             range=f"'{self.sheet_name}'!A{start_row_index_1_based}",
@@ -148,24 +204,18 @@ class GoogleSheetService:
         ).execute()
 
     def parse_sheet_for_today(self, all_values):
-        """
-        Reads existing sheet state. Identifies:
-        1. Where today's block is located.
-        2. All existing tickets logged in today's block (including manually added ones).
-        3. Their exact manual statuses, implementors, and descriptions.
-        """
         today_str = datetime.now(IST).strftime("%d/%m/%Y")
         today_str_alt = datetime.now(IST).strftime("%d/%m/%y")
 
         today_block_start = -1
         next_block_start = -1
-        existing_today_tickets = {}  # {key: {"row_idx": i, "env": ..., "status": ..., "desc": ..., "owner": ...}}
+        existing_today_tickets = {}
 
         for idx, row in enumerate(all_values):
             if not row or not row[0]:
                 continue
             cell = str(row[0]).strip()
-            
+
             if today_str in cell or today_str_alt in cell:
                 if today_block_start == -1:
                     today_block_start = idx + 1
@@ -174,7 +224,14 @@ class GoogleSheetService:
                 break
 
             if today_block_start != -1 and len(row) > 1 and row[1]:
-                t_key = row[1].strip()
+                # Strip out formula if hyperlinked, e.g. =HYPERLINK("...", "INTU-313")
+                raw_cell = row[1].strip()
+                t_key = raw_cell
+                if '", "' in raw_cell:
+                    t_key = raw_cell.split('", "')[-1].replace('")', '').strip()
+                elif '",' in raw_cell:
+                    t_key = raw_cell.split('",')[-1].replace(')', '').replace('"', '').strip()
+
                 if t_key not in ["CR", "Change"]:
                     existing_today_tickets[t_key] = {
                         "row": idx + 1,
@@ -190,29 +247,22 @@ class GoogleSheetService:
         return today_block_start, insertion_index, existing_today_tickets
 
     def create_clean_today_block(self, rows_to_add, start_row_1_based):
-        """
-        Creates today's block:
-        1. Date separator banner with NO dropdowns.
-        2. Column header row (Dark Navy, bold white text) with NO dropdowns.
-        3. Data rows with grid styling.
-        """
         today_str = datetime.now(IST).strftime("%d/%m/%Y")
         all_block_rows = [
-            [], # Blank spacer row
-            [today_str] + [""] * 8, # Row 300: Banner
-            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status'] # Row 301: Headers
+            [],
+            [today_str] + [""] * 8,
+            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status']
         ] + rows_to_add
 
-        # 1. Append the rows
         self.append_rows(all_block_rows)
 
-        banner_row_1 = start_row_1_based + 2   # Row 300
-        header_row_1 = start_row_1_based + 3   # Row 301
+        banner_row_1 = start_row_1_based + 2
+        header_row_1 = start_row_1_based + 3
         data_start_row_1 = start_row_1_based + 4
         data_end_row_1 = data_start_row_1 + len(rows_to_add) - 1
 
         requests_list = [
-            # A. MERGE Banner across Col A (0) to Col I (9)
+            # A. MERGE Banner Col A-I
             {
                 "mergeCells": {
                     "range": {
@@ -225,7 +275,7 @@ class GoogleSheetService:
                     "mergeType": "MERGE_ALL"
                 }
             },
-            # B. Style Banner (Light Blue #4a86e8, Centered, Bold White, Font Size 10)
+            # B. Style Banner (Blue fill, White bold text)
             {
                 "repeatCell": {
                     "range": {
@@ -246,7 +296,7 @@ class GoogleSheetService:
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # C. REMOVE ALL DROPDOWNS from Banner Row (Clear Data Validation)
+            # C. REMOVE DROPDOWNS from Banner Row
             {
                 "setDataValidation": {
                     "range": {
@@ -259,7 +309,7 @@ class GoogleSheetService:
                     "rule": None
                 }
             },
-            # D. Style Column Header Row (Dark Navy #0b5394, Bold White text)
+            # D. Style Column Header Row (Dark Navy #0b5394, Bold White)
             {
                 "repeatCell": {
                     "range": {
@@ -271,7 +321,7 @@ class GoogleSheetService:
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.04, "green": 0.33, "blue": 0.58}, # #0b5394
+                            "backgroundColor": {"red": 0.04, "green": 0.33, "blue": 0.58},
                             "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "fontSize": 9},
                             "horizontalAlignment": "CENTER",
                             "verticalAlignment": "MIDDLE"
@@ -280,7 +330,7 @@ class GoogleSheetService:
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # E. REMOVE ALL DROPDOWNS from Column Header Row
+            # E. REMOVE DROPDOWNS from Header Row
             {
                 "setDataValidation": {
                     "range": {
@@ -299,9 +349,8 @@ class GoogleSheetService:
             spreadsheetId=self.spreadsheet_id, body={"requests": requests_list}
         ).execute()
 
-        # Apply solid grid borders to newly appended data rows
         self.format_borders(data_start_row_1, data_end_row_1)
-        print("🎨 Cleaned block: Dropdowns removed from Banner & Headers. Navy theme applied!")
+        print("🎨 Cleaned block: Dropdowns removed from Banner & Headers. Formatted correctly!")
 
     def format_borders(self, start_row_1, end_row_1):
         border_spec = {
@@ -332,16 +381,9 @@ class GoogleSheetService:
         ).execute()
 
 # ==============================================================================
-# STATUS PARITY LOGIC (MANUAL SHEET EDITS ALWAYS PERSIST & WIN)
+# STATUS PARITY LOGIC
 # ==============================================================================
 def resolve_parity(sheet_data, jira_ticket):
-    """
-    Priority Rules:
-    1. If manually marked in the Sheet, the Sheet's status WINS.
-    2. If either Sheet OR Jira is Done -> Done (✅)
-    3. If either is In Progress -> In Progress (⚙️)
-    4. Otherwise -> Pending (⏳)
-    """
     s_status = (sheet_data.get("status") if sheet_data else "").strip().lower()
     j_status = (jira_ticket.fields.status.name if jira_ticket else "").strip().lower()
 
@@ -365,7 +407,7 @@ class GeminiService:
 
     def analyze_unified_deployments(self, unified_list):
         prompt = f"""
-        Analyze this raw deployment data from our Deployment Tracker (combination of Jira and manual Sheet entries).
+        Analyze this raw deployment data from our Deployment Tracker (Jira + manual Sheet entries).
         Data:
         {json.dumps(unified_list, indent=2)}
 
@@ -475,20 +517,17 @@ def send_to_gchat(card_data):
 # ==============================================================================
 def main():
     print(f"\n--- Starting Integrated ReleaseRadar Bot ({datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}) ---")
-    
+
     jira = JiraService(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN)
     sheets = GoogleSheetService(GOOGLE_SHEET_FILE_ID, GOOGLE_WORKSHEET_NAME)
     gemini = GeminiService(GCP_PROJECT_ID, GCP_LOCATION)
 
     jira_tickets = jira.get_planned_changes()
 
-    # 1. Inspect existing sheet data
+    # 1. Parse existing sheet to preserve manual entries and formatting
     all_values = sheets.get_all_values()
     today_block_row, insertion_idx, existing_sheet_tickets = sheets.parse_sheet_for_today(all_values)
 
-    print(f"[Tracker State] Today's block row: {today_block_row}. Existing tickets in block: {list(existing_sheet_tickets.keys())}")
-
-    # 2. De-duplication: ONLY add tickets that do NOT exist in the sheet
     new_tickets_to_add = []
     jira_dict = {}
     for t in jira_tickets:
@@ -498,36 +537,42 @@ def main():
 
     print(f"[Sync] {len(existing_sheet_tickets)} tickets already in sheet (PERSISTED). {len(new_tickets_to_add)} new Jira ticket(s) to add.")
 
-    # 3. Add new tickets if necessary
+    # 2. Add new tickets with HYPERLINK and EXTRACTED AFFECTED SERVICE
     if new_tickets_to_add:
         rows_to_add = []
         for t in new_tickets_to_add:
             summary = t.fields.summary
             env = "PROD" if "prod" in summary.lower() else "UAT"
             assignee = t.fields.assignee.displayName if t.fields.assignee else "Unassigned"
+
+            # 🔗 Clickable Jira Hyperlink Formula
+            jira_link_formula = f'=HYPERLINK("{JIRA_SERVER}/browse/{t.key}", "{t.key}")'
+
+            # 🎯 Extract Affected Service (e.g. "IC SA")
+            app_service = jira.extract_affected_service(t)
+
             rows_to_add.append([
-                datetime.now(IST).strftime("%d/%m/%Y"), # Date
-                t.key,                                   # CR
-                env,                                     # Env
-                "Upload",                                # Type
-                "",                                      # Application
-                summary,                                 # Description
-                assignee,                                # Implementor
-                "10:00:00",                              # Start Time
-                t.fields.status.name                     # Status
+                datetime.now(IST).strftime("%d/%m/%Y"), # Col A: Date
+                jira_link_formula,                      # Col B: CR (Clickable Link)
+                env,                                    # Col C: Env
+                "Upload",                               # Col D: Type
+                app_service,                            # Col E: Application (From Affected services)
+                summary,                                # Col F: Description
+                assignee,                               # Col G: Implementor
+                "10:00:00",                             # Col H: Start Time
+                t.fields.status.name                    # Col I: Status
             ])
 
         if today_block_row == -1:
-            print("Creating brand new styled block (No dropdowns on headers, Navy theme)...")
+            print("Creating styled today block with hyperlinked tickets & clean headers...")
             sheets.create_clean_today_block(rows_to_add, len(all_values))
         else:
-            print(f"Inserting {len(rows_to_add)} new row(s) at line {insertion_idx} (never overwrites manual rows)...")
+            print(f"Inserting {len(rows_to_add)} new row(s) at line {insertion_idx}...")
             sheets.insert_rows_at(rows_to_add, insertion_idx)
     else:
         print("✅ No new tickets to insert. All existing manual entries and statuses are untouched.")
 
-    # 4. Prepare Unified Deployment List for Gemini & Google Chat
-    # Combine: (A) Sheet entries (with manual edits prioritized) + (B) Jira comments/context
+    # 3. Prepare Unified List for Gemini Analysis & Chat
     unified_list = []
     all_active_keys = set(existing_sheet_tickets.keys()) | set(jira_dict.keys())
 
@@ -537,11 +582,10 @@ def main():
 
         effective_status, effective_emoji = resolve_parity(s_data, j_data)
 
-        # Manual sheet values take priority over Jira for display
         desc = s_data.get("desc") if (s_data and s_data.get("desc")) else (j_data.fields.summary if j_data else key)
         owner = s_data.get("owner") if (s_data and s_data.get("owner")) else (j_data.fields.assignee.displayName if j_data and j_data.fields.assignee else "TOC")
         env = s_data.get("env") if (s_data and s_data.get("env")) else ("PROD" if "prod" in desc.lower() else "UAT")
-        app = s_data.get("app") if (s_data and s_data.get("app")) else ""
+        app = s_data.get("app") if (s_data and s_data.get("app")) else (jira.extract_affected_service(j_data) if j_data else "")
 
         comments = []
         if j_data and hasattr(j_data.fields, 'comment') and j_data.fields.comment:
@@ -558,7 +602,7 @@ def main():
             "recent_comments": comments
         })
 
-    # 5. Broadcast to Google Chat
+    # 4. Gemini Processing & Chat Broadcast
     analysis = gemini.analyze_unified_deployments(unified_list)
     if analysis:
         send_to_gchat(analysis)
