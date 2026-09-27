@@ -18,7 +18,6 @@ JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
-# Strict JQL bounded to active changes from today through the next 10 days
 JQL_QUERY = os.getenv(
     "JQL_QUERY",
     """
@@ -46,7 +45,7 @@ STATE_CACHE_FILE = "sheet_last_status_cache.json"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ==============================================================================
-# 1. JIRA SERVICE (EXACT METADATA DATE EXTRACTION)
+# 1. JIRA SERVICE (ACCURATE "PLANNED START" RESOLVER)
 # ==============================================================================
 class JiraClient:
     def __init__(self):
@@ -54,6 +53,20 @@ class JiraClient:
             print("❌ JIRA_EMAIL or JIRA_API_TOKEN missing!", file=sys.stderr)
             sys.exit(1)
         self.client = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
+        self.planned_start_field_id = self._discover_planned_start_field_id()
+
+    def _discover_planned_start_field_id(self):
+        """Discovers the exact custom field ID for 'Planned start' in Osttra Jira."""
+        try:
+            fields = self.client.fields()
+            for f in fields:
+                name = str(f.get('name', '')).strip().lower()
+                if name in ["planned start", "planned start date"]:
+                    print(f"🎯 Discovered Planned Start field: '{f['name']}' -> ID: '{f['id']}'")
+                    return f['id']
+        except Exception as e:
+            print(f"⚠️ Could not list fields: {e}")
+        return None
 
     def fetch_candidates(self):
         try:
@@ -63,31 +76,41 @@ class JiraClient:
             print(f"❌ Jira query error: {e}", file=sys.stderr)
             return []
 
-    def get_iso_planned_date(self, issue):
-        """
-        Extracts the EXACT Planned Start timestamp from Jira metadata.
-        Never guesses from summary text.
-        """
+    def get_exact_planned_start(self, issue):
+        """Extracts the exact date strictly from Planned Start."""
         raw = issue.raw.get('fields', {})
-        for field_name in ["customfield_11400", "customfield_10015", "plannedstart", "customfield_10020"]:
-            val = raw.get(field_name)
+        
+        # 1. Use discovered field ID
+        if self.planned_start_field_id:
+            val = raw.get(self.planned_start_field_id)
             if val and isinstance(val, str) and len(val) >= 10:
                 return val
 
-        # Fallback to created date
-        return str(getattr(issue.fields, "created", ""))
+        # 2. Check known field keys
+        for key in ["customfield_11400", "customfield_10015", "customfield_10020", "customfield_10600", "plannedstart"]:
+            val = raw.get(key)
+            if val and isinstance(val, str) and len(val) >= 10:
+                return val
+
+        # 3. Dynamic scan across all fields for a future/current date string (NEVER use 'created')
+        for k, v in raw.items():
+            if k in ["created", "updated", "resolutiondate", "lastViewed"]:
+                continue
+            if isinstance(v, str) and len(v) >= 10 and v[:4].isdigit() and v[4] == '-' and v[7] == '-':
+                # Check if it's 2026
+                if v.startswith("2026"):
+                    return v
+
+        return None
 
 # ==============================================================================
-# 2. DATE PARSER (CONVERTS JIRA TIMESTAMP TO IST DD/MM/YYYY)
+# 2. DATE PARSER (CONVERTS TO IST)
 # ==============================================================================
-def parse_jira_date_to_ist(iso_string):
-    """
-    Parses '2026-09-29T12:00:00.000+0530' or '2026-09-29' into an IST datetime object.
-    """
+def parse_to_ist(iso_string):
     if not iso_string:
-        return datetime.now(IST)
+        return None
 
-    clean_str = iso_string.split('.')[0] # Remove milliseconds
+    clean_str = iso_string.split('.')[0]
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
         try:
             dt = datetime.strptime(clean_str[:len(fmt) + 2], fmt)
@@ -98,10 +121,10 @@ def parse_jira_date_to_ist(iso_string):
         dt = datetime.strptime(iso_string[:10], "%Y-%m-%d")
         return dt.replace(tzinfo=IST)
     except Exception:
-        return datetime.now(IST)
+        return None
 
 # ==============================================================================
-# 3. VERTEX AI (GEMINI 2.5 FLASH) INTELLIGENT TOC EVALUATOR
+# 3. VERTEX AI (GEMINI 2.5 FLASH) TOC REVIEWER
 # ==============================================================================
 class SeniorTOCReviewer:
     def __init__(self, project_id, location):
@@ -110,23 +133,17 @@ class SeniorTOCReviewer:
         print("⚡ Vertex AI (Gemini 2.5 Flash) Reviewer initialized.")
 
     def evaluate_and_clean_tickets(self, raw_candidates):
-        """
-        Gemini acts as the TOC engineer:
-        - Drops pure DBA segregation / network / non-TOC changes
-        - Cleans up the summary/description into a single readable line (no massive markdown tables)
-        - Normalizes Application name to clean dropdown standard
-        """
         system_instruction = """
         You are a Senior TOC Deployment Engineer at Osttra.
         Review these deployment change tickets.
         
         RULES:
         1. FILTER:
-           - KEEP: Application deployments, patch releases, transform updates, JVM flags, config changes, go-lives across Osttra applications.
-           - DROP: Pure DBA tasks (e.g., 'JPTRM database segregation' where DBA is owner and TOC has no application deployment role), network cabling, or Jira admin tasks.
+           - KEEP: Real application deployments, patch releases, transform updates, JVM flags, config changes across Osttra applications.
+           - DROP: Pure DBA tasks (e.g. 'JPTRM database segregation' where DBA is owner and TOC has no application deployment role), network cabling, or Jira admin tasks.
         2. CLEAN DESCRIPTION:
            - Create a clean, single-line summary (MAX 120 characters).
-           - Remove massive markdown runbooks, release note URLs, or multi-line tables. Keep only the essence of the change.
+           - Remove massive markdown runbooks, release note URLs, or multi-line tables.
         3. APPLICATION:
            - Return clean short application name: ("TradeSTP", "LimitHub", "ETD", "EQ", "CFS", "HAR", "Harmony", "SocGen", "IC SA", "DealHub", "CCPC", "MW", "AAS", "ODC", "Cashflow", "CL", "TS").
         4. ENV: "PROD", "UAT", "DR", or "PROD DR".
@@ -148,12 +165,9 @@ class SeniorTOCReviewer:
             ]
         }
         """
-
-        prompt = f"Raw Candidates:\n{json.dumps(raw_candidates, indent=2)}"
-
         try:
             resp = self.model.generate_content(
-                f"{system_instruction}\n\n{prompt}",
+                f"{system_instruction}\n\nCandidates:\n{json.dumps(raw_candidates, indent=2)}",
                 generation_config=GenerationConfig(
                     response_mime_type="application/json",
                     temperature=0.0
@@ -166,7 +180,7 @@ class SeniorTOCReviewer:
             return []
 
 # ==============================================================================
-# 4. GOOGLE SHEETS & DRIVE ENGINE (ELEGANT GROUPED FORMATTING)
+# 4. GOOGLE SHEETS & DRIVE ENGINE
 # ==============================================================================
 class GoogleSheetEngine:
     def __init__(self):
@@ -245,12 +259,11 @@ class GoogleSheetEngine:
         ).execute()
 
     def create_vibrant_date_block(self, sheet_id, tab_name, date_str, rows_to_add, start_row_1_based):
-        """Creates a professional, grouped date block with no stray dropdowns."""
         s_id_num = self.get_sheet_id_num(sheet_id, tab_name)
         block_rows = [
             [], # Empty spacer
-            [date_str] + [""] * 8, # Row A: Merged Date Banner
-            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status'] # Row B: Header Row
+            [date_str] + [""] * 8, # Banner
+            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status'] # Headers
         ] + rows_to_add
 
         self.append_rows(sheet_id, tab_name, block_rows)
@@ -295,7 +308,7 @@ class GoogleSheetEngine:
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # 3. Clear Data Validation from Date Banner
+            # 3. Clear Dropdowns from Banner
             {
                 "setDataValidation": {
                     "range": {
@@ -329,7 +342,7 @@ class GoogleSheetEngine:
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # 5. Clear Data Validation from Header Row
+            # 5. Clear Dropdowns from Header Row
             {
                 "setDataValidation": {
                     "range": {
@@ -369,7 +382,7 @@ class GoogleSheetEngine:
         self.sheets_api.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body=body).execute()
 
 # ==============================================================================
-# 5. MAIN ORCHESTRATION CYCLE
+# 5. MAIN EXECUTION CYCLE
 # ==============================================================================
 def main():
     now_ist = datetime.now(IST)
@@ -387,14 +400,18 @@ def main():
         print("No active candidates in Jira. Exiting.")
         return
 
-    # 2. Extract EXACT metadata dates directly from Jira fields
+    # 2. Extract EXACT metadata Planned Start dates
     issue_date_map = {}
     serialized_candidates = []
     for issue in jira_issues:
-        raw_iso = jira.get_iso_planned_date(issue)
-        planned_dt = parse_jira_date_to_ist(raw_iso)
-        issue_date_map[issue.key] = planned_dt
+        raw_iso = jira.get_exact_planned_start(issue)
+        planned_dt = parse_to_ist(raw_iso)
+        
+        if not planned_dt:
+            print(f"⚠️ Skipping {issue.key}: Could not find a valid Planned Start date.")
+            continue
 
+        issue_date_map[issue.key] = planned_dt
         serialized_candidates.append({
             "key": issue.key,
             "summary": issue.fields.summary,
@@ -404,7 +421,7 @@ def main():
             "description": (issue.fields.description or "")[:300]
         })
 
-    # 3. Let Gemini evaluate: filter out non-TOC tasks (like DBA) & clean descriptions
+    # 3. Gemini evaluates: drops pure DBA tasks & cleans descriptions
     reviewed_list = ai_reviewer.evaluate_and_clean_tickets(serialized_candidates)
     reviewed_dict = {t["key"]: t for t in reviewed_list if t.get("is_toc_deployment", True)}
 
@@ -441,17 +458,17 @@ def main():
             if k not in ["Change", "CR", "Saturday", "Sunday"]:
                 existing_tracker[k] = {"type": "weekend", "row": i + 1, "status": row[7].strip() if len(row) > 7 else ""}
 
-    # 5. Group tickets by Destination & Date
-    daily_grouped_new = {}   # { "29/09/2026": [rows...] }
-    weekend_new_tickets = [] # [ (weekend_section, row)... ]
+    # 5. Group tickets by Destination & Date strictly using Planned Start
+    daily_grouped_new = {}
+    weekend_new_tickets = []
 
     for issue in jira_issues:
         key = issue.key
-        if key not in reviewed_dict:
-            continue # Discarded by AI filter
+        if key not in reviewed_dict or key not in issue_date_map:
+            continue
 
         t_info = reviewed_dict[key]
-        planned_dt = issue_date_map.get(key, now_ist)
+        planned_dt = issue_date_map[key]
         date_str = planned_dt.strftime("%d/%m/%Y")
         weekday_idx = planned_dt.weekday() # 5 = Sat, 6 = Sun
         is_weekend = weekday_idx >= 5
@@ -459,13 +476,13 @@ def main():
 
         cr_hyperlink = f'=HYPERLINK("{JIRA_SERVER}/browse/{key}", "{key}")'
         clean_desc = t_info.get("clean_description") or issue.fields.summary
-        clean_desc = re.sub(r'[\r\n]+', ' ', clean_desc).strip() # Ensure single-line clean description
+        clean_desc = re.sub(r'[\r\n]+', ' ', clean_desc).strip()
         app_name = t_info.get("application", "")
         env = t_info.get("env", "PROD")
         type_val = t_info.get("type", "Normal")
         impl = t_info.get("implementor") or (issue.fields.assignee.displayName if issue.fields.assignee else "TOC")
 
-        # Bi-directional completion sync if ticket already exists
+        # Bi-directional sync if ticket already exists
         if key in existing_tracker:
             info = existing_tracker[key]
             s_stat = str(info["status"]).strip().lower()
@@ -478,9 +495,10 @@ def main():
                 existing_tracker[key]["status"] = "Done"
             continue
 
-        # Prepare new row
+        # Ingest New Ticket: Weekend vs Daily
         if is_weekend and weekend_sheet_id:
             w_section = "Saturday" if weekday_idx == 5 else "Sunday"
+            print(f"🗓️ Ingesting {key} ({date_str}) into Weekend Sheet under {w_section}...")
             weekend_row = [
                 cr_hyperlink, env, type_val, clean_desc, app_name,
                 "TOC", "TOC", "Pending", "Pending", impl, "10:00:00", ""
@@ -488,6 +506,7 @@ def main():
             weekend_new_tickets.append((w_section, weekend_row))
             existing_tracker[key] = {"type": "weekend", "status": "Pending"}
         else:
+            print(f"📅 Ingesting {key} ({date_str}) into Daily Changes Sheet...")
             daily_row = [
                 date_str, cr_hyperlink, env, type_val, app_name,
                 clean_desc, impl, "10:00:00", j_stat
