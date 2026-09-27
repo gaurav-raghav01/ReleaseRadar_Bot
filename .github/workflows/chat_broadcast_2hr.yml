@@ -1,0 +1,31 @@
+name: Chat 2-Hour Status Broadcast
+
+on:
+  schedule:
+    # Runs at 9:30, 11:30, 13:30, 15:30, 17:30, 19:30, 21:00 IST
+    - cron: '0 4,6,8,10,12,14,15 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  broadcast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests google-auth google-api-python-client vertexai
+      - name: Inject GCP Credentials
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: echo "$GCP_CREDENTIALS" > gcp_keys.json
+      - name: Run Broadcast
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
+          WEBHOOK_URL: ${{ secrets.GC_WEBHOOK_URL }}
+        run: python chat_broadcast_bot.py
