@@ -3,6 +3,7 @@ import sys
 import json
 from datetime import datetime, timedelta, timezone
 import requests
+
 import google.auth
 from googleapiclient.discovery import build
 import vertexai
@@ -22,12 +23,12 @@ JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ==============================================================================
-# EMOJI STATUS RESOLVER (NEW SPECIFIED RULES)
+# EMOJI RESOLVER WITH SIREN & CONSTRUCTION EMOJIS
 # ==============================================================================
 def resolve_status_and_emoji(raw_status):
     """
     - Done / Completed -> ✅
-    - In Progress / Started / Implementing -> ⚙️
+    - In Progress / Implementing / Started -> ⚙️
     - Pending / Scheduled / To Do -> ⏳
     - Failed -> 🚨 (Siren)
     - Backed Out / Rescheduled / Cancelled -> 🚧 (Construction)
@@ -142,7 +143,7 @@ def run_gemini_analysis(deployments):
     model = GenerativeModel("gemini-2.5-flash")
 
     prompt = f"""
-    Analyze this active deployment status data from our Deployment Tracker.
+    Analyze this active deployment status data from Google Sheets (The Source of Truth).
     Data:
     {json.dumps(deployments, indent=2)}
 
@@ -173,7 +174,7 @@ def run_gemini_analysis(deployments):
         clean = resp.text.strip().replace("```json", "").replace("```", "")
         return json.loads(clean)
     except Exception as e:
-        print(f"❌ Gemini analysis error: {e}")
+        print(f"❌ Gemini analysis error: {e}", file=sys.stderr)
         return None
 
 # ==============================================================================
@@ -242,7 +243,7 @@ def broadcast_to_gchat(card_data):
     if resp.status_code == 200:
         print("✅ Google Chat update broadcasted successfully!")
     else:
-        print(f"❌ Chat post failed: {resp.status_code}, {resp.text}")
+        print(f"❌ Chat post failed: {resp.status_code}, {resp.text}", file=sys.stderr)
 
 def main():
     print(f"\n📢 [Chat Broadcast Bot] Starting 2-Hour Status Broadcast ({datetime.now(IST).strftime('%H:%M:%S IST')})...")
