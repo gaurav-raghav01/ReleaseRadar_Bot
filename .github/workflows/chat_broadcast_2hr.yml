@@ -1,9 +1,6 @@
 name: Chat 2-Hour Status Broadcast
 
 on:
-  schedule:
-    # Runs at 9:30, 11:30, 13:30, 15:30, 17:30, 19:30, 21:00 IST
-    - cron: '0 4,6,8,10,12,14,15 * * *'
   workflow_dispatch: {}
 
 jobs:
