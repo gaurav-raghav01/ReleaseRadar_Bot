@@ -5,6 +5,8 @@ import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from jira import JIRA
+import requests
+from requests.auth import HTTPBasicAuth
 
 import google.auth
 from googleapiclient.discovery import build
@@ -18,6 +20,7 @@ JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
+# Strict JQL bounded from today to next 10 days
 JQL_QUERY = os.getenv(
     "JQL_QUERY",
     """
@@ -45,75 +48,72 @@ STATE_CACHE_FILE = "sheet_last_status_cache.json"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ==============================================================================
-# 1. JIRA SERVICE (ACCURATE "PLANNED START" RESOLVER)
+# 1. JIRA SERVICE (WITH ROBUST REST API FIELD DISCOVERY)
 # ==============================================================================
 class JiraClient:
     def __init__(self):
         if not JIRA_EMAIL or not JIRA_API_TOKEN:
-            print("❌ JIRA_EMAIL or JIRA_API_TOKEN missing!", file=sys.stderr)
+            print("❌ JIRA_EMAIL or JIRA_API_TOKEN is missing!", file=sys.stderr)
             sys.exit(1)
+        self.auth = HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
         self.client = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
-        self.planned_start_field_id = self._discover_planned_start_field_id()
+        self.planned_start_field_id = self._discover_field_id("Planned start")
+        print(f"🎯 Verified 'Planned start' Field ID: {self.planned_start_field_id}")
 
-    def _discover_planned_start_field_id(self):
-        """Discovers the exact custom field ID for 'Planned start' in Osttra Jira."""
+    def _discover_field_id(self, target_name):
+        """Discovers the exact custom field key using direct REST API JSON."""
         try:
-            fields = self.client.fields()
-            for f in fields:
-                name = str(f.get('name', '')).strip().lower()
-                if name in ["planned start", "planned start date"]:
-                    print(f"🎯 Discovered Planned Start field: '{f['name']}' -> ID: '{f['id']}'")
-                    return f['id']
+            url = f"{JIRA_SERVER}/rest/api/3/field"
+            resp = requests.get(url, auth=self.auth, headers={"Accept": "application/json"}, timeout=10)
+            if resp.status_code == 200:
+                fields = resp.json()
+                for f in fields:
+                    if str(f.get('name', '')).strip().lower() == target_name.lower():
+                        return f.get('id')
         except Exception as e:
-            print(f"⚠️ Could not list fields: {e}")
-        return None
+            print(f"⚠️ Field discovery warning: {e}")
+        return "customfield_11400" # Common default for planned start
 
     def fetch_candidates(self):
         try:
-            print("🔍 Fetching active and upcoming change tickets from Jira...")
+            print("🔍 Querying Jira for candidate changes...")
             return self.client.search_issues(JQL_QUERY, maxResults=60, fields=['*all'])
         except Exception as e:
             print(f"❌ Jira query error: {e}", file=sys.stderr)
             return []
 
-    def get_exact_planned_start(self, issue):
-        """Extracts the exact date strictly from Planned Start."""
+    def get_planned_start_iso(self, issue):
         raw = issue.raw.get('fields', {})
-        
-        # 1. Use discovered field ID
-        if self.planned_start_field_id:
-            val = raw.get(self.planned_start_field_id)
-            if val and isinstance(val, str) and len(val) >= 10:
-                return val
 
-        # 2. Check known field keys
+        # 1. Check discovered field ID
+        if self.planned_start_field_id and raw.get(self.planned_start_field_id):
+            return str(raw[self.planned_start_field_id])
+
+        # 2. Check common custom field IDs
         for key in ["customfield_11400", "customfield_10015", "customfield_10020", "customfield_10600", "plannedstart"]:
             val = raw.get(key)
             if val and isinstance(val, str) and len(val) >= 10:
                 return val
 
-        # 3. Dynamic scan across all fields for a future/current date string (NEVER use 'created')
+        # 3. Search for any field value with matching date format
         for k, v in raw.items():
             if k in ["created", "updated", "resolutiondate", "lastViewed"]:
                 continue
-            if isinstance(v, str) and len(v) >= 10 and v[:4].isdigit() and v[4] == '-' and v[7] == '-':
-                # Check if it's 2026
-                if v.startswith("2026"):
-                    return v
+            if isinstance(v, str) and len(v) >= 10 and v.startswith("2026-") and v[4] == '-' and v[7] == '-':
+                return v
 
         return None
 
 # ==============================================================================
-# 2. DATE PARSER (CONVERTS TO IST)
+# 2. DATE PARSER (CONVERTS JIRA TIMESTAMP TO IST)
 # ==============================================================================
 def parse_to_ist(iso_string):
     if not iso_string:
         return None
-
-    clean_str = iso_string.split('.')[0]
+    clean = iso_string.split('.')[0]
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
         try:
-            dt = datetime.strptime(clean_str[:len(fmt) + 2], fmt)
+            dt = datetime.strptime(clean[:len(fmt) + 2], fmt)
             return dt.replace(tzinfo=IST)
         except Exception:
             pass
@@ -124,30 +124,32 @@ def parse_to_ist(iso_string):
         return None
 
 # ==============================================================================
-# 3. VERTEX AI (GEMINI 2.5 FLASH) TOC REVIEWER
+# 3. VERTEX AI (GEMINI 2.5 FLASH) TOC THINKER
 # ==============================================================================
 class SeniorTOCReviewer:
     def __init__(self, project_id, location):
         vertexai.init(project=project_id, location=location)
         self.model = GenerativeModel("gemini-2.5-flash")
-        print("⚡ Vertex AI (Gemini 2.5 Flash) Reviewer initialized.")
+        print("⚡ Vertex AI (Gemini 2.5 Flash) Senior Reviewer initialized.")
 
     def evaluate_and_clean_tickets(self, raw_candidates):
         system_instruction = """
         You are a Senior TOC Deployment Engineer at Osttra.
-        Review these deployment change tickets.
+        Evaluate each candidate change ticket:
         
         RULES:
-        1. FILTER:
-           - KEEP: Real application deployments, patch releases, transform updates, JVM flags, config changes across Osttra applications.
-           - DROP: Pure DBA tasks (e.g. 'JPTRM database segregation' where DBA is owner and TOC has no application deployment role), network cabling, or Jira admin tasks.
-        2. CLEAN DESCRIPTION:
-           - Create a clean, single-line summary (MAX 120 characters).
-           - Remove massive markdown runbooks, release note URLs, or multi-line tables.
-        3. APPLICATION:
-           - Return clean short application name: ("TradeSTP", "LimitHub", "ETD", "EQ", "CFS", "HAR", "Harmony", "SocGen", "IC SA", "DealHub", "CCPC", "MW", "AAS", "ODC", "Cashflow", "CL", "TS").
-        4. ENV: "PROD", "UAT", "DR", or "PROD DR".
-        5. TYPE: "Upload", "Normal", or "SC".
+        1. EXCLUDE RAVI GOYAL:
+           - Any ticket assigned to 'Ravi Goyal' or reported by 'Ravi Goyal' MUST be set to "is_toc_deployment": false.
+        2. EXCLUDE PURE DBA TASKS:
+           - Exclude tasks strictly owned by DBAs (e.g. database segregation, schema drops, tablespace migrations without TOC application deployment).
+        3. KEEP TOC APPLICATION RELEASES:
+           - Keep all software releases, patch drops, transforms, JVM updates, and go-lives across Osttra applications (TradeSTP, LimitHub, ETD, EQ, CFS, HAR, Harmony, SocGen, IC SA, DealHub, CCPC, MW, AAS, ODC, Cashflow, CL).
+        4. CLEAN DESCRIPTION:
+           - Strictly create a single-line summary (MAX 100 characters). Remove multi-line runbook URLs or tables.
+        5. CLEAN APPLICATION:
+           - Return clean short name: ("TradeSTP", "LimitHub", "ETD", "EQ", "CFS", "HAR", "Harmony", "SocGen", "IC SA", "DealHub", "CCPC", "MW", "AAS", "ODC", "Cashflow", "CL", "TS").
+        6. ENV: "PROD", "UAT", "DR", or "PROD DR".
+        7. TYPE: "Upload", "Normal", or "SC".
 
         OUTPUT STRICT JSON ONLY:
         {
@@ -262,8 +264,8 @@ class GoogleSheetEngine:
         s_id_num = self.get_sheet_id_num(sheet_id, tab_name)
         block_rows = [
             [], # Empty spacer
-            [date_str] + [""] * 8, # Banner
-            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status'] # Headers
+            [date_str] + [""] * 8, # Row A: Date Banner
+            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status'] # Row B: Header Row
         ] + rows_to_add
 
         self.append_rows(sheet_id, tab_name, block_rows)
@@ -274,7 +276,7 @@ class GoogleSheetEngine:
         data_end_row_1 = data_start_row_1 + len(rows_to_add) - 1
 
         requests = [
-            # 1. Merge Date Banner
+            # 1. Merge Banner across Col A (0) to Col I (9)
             {
                 "mergeCells": {
                     "range": {
@@ -308,7 +310,7 @@ class GoogleSheetEngine:
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # 3. Clear Dropdowns from Banner
+            # 3. Clear Data Validation (No Dropdowns) from Banner
             {
                 "setDataValidation": {
                     "range": {
@@ -342,7 +344,7 @@ class GoogleSheetEngine:
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # 5. Clear Dropdowns from Header Row
+            # 5. Clear Data Validation from Column Header Row
             {
                 "setDataValidation": {
                     "range": {
@@ -394,21 +396,29 @@ def main():
     ai_reviewer = SeniorTOCReviewer(GCP_PROJECT_ID, GCP_LOCATION)
     engine = GoogleSheetEngine()
 
-    # 1. Fetch from Jira
+    # 1. Fetch Candidates from Jira
     jira_issues = jira.fetch_candidates()
     if not jira_issues:
-        print("No active candidates in Jira. Exiting.")
+        print("No active candidates found in Jira. Exiting.")
         return
 
-    # 2. Extract EXACT metadata Planned Start dates
+    # 2. Extract EXACT Planned Start Dates
     issue_date_map = {}
     serialized_candidates = []
+
     for issue in jira_issues:
-        raw_iso = jira.get_exact_planned_start(issue)
+        assignee_name = issue.fields.assignee.displayName if issue.fields.assignee else "Unassigned"
+
+        # Explicitly ignore Ravi Goyal
+        if "ravi goyal" in assignee_name.lower():
+            print(f"🚫 Skipping {issue.key}: Assigned to Ravi Goyal.")
+            continue
+
+        raw_iso = jira.get_planned_start_iso(issue)
         planned_dt = parse_to_ist(raw_iso)
-        
+
         if not planned_dt:
-            print(f"⚠️ Skipping {issue.key}: Could not find a valid Planned Start date.")
+            print(f"⚠️ Skipping {issue.key}: No valid Planned Start date.")
             continue
 
         issue_date_map[issue.key] = planned_dt
@@ -416,26 +426,25 @@ def main():
             "key": issue.key,
             "summary": issue.fields.summary,
             "status": issue.fields.status.name,
-            "assignee": issue.fields.assignee.displayName if issue.fields.assignee else "TOC",
-            "metadata_planned_date": planned_dt.strftime("%d/%m/%Y"),
-            "description": (issue.fields.description or "")[:300]
+            "assignee": assignee_name,
+            "planned_date": planned_dt.strftime("%d/%m/%Y"),
+            "description": (issue.fields.description or "")[:250]
         })
 
-    # 3. Gemini evaluates: drops pure DBA tasks & cleans descriptions
+    # 3. Run AI Review
     reviewed_list = ai_reviewer.evaluate_and_clean_tickets(serialized_candidates)
     reviewed_dict = {t["key"]: t for t in reviewed_list if t.get("is_toc_deployment", True)}
+    print(f"🧠 TOC Review Approved: {len(reviewed_dict)} deployment changes.")
 
-    print(f"🧠 TOC Review Complete: {len(reviewed_dict)} deployment changes approved for sheet tracking.")
-
-    # 4. Read existing sheets to map current state and protect manual edits
+    # 4. Read Existing Sheets to Protect Manual Edits
     daily_vals = engine.read_sheet(DAILY_SHEET_ID, DAILY_TAB_NAME)
     weekend_sheet_id, weekend_name = engine.resolve_weekend_sheet_id(now_ist)
     weekend_vals = engine.read_sheet(weekend_sheet_id, "Sheet1") if weekend_sheet_id else []
 
     existing_tracker = {}
-
-    # Map existing daily entries
     existing_daily_dates = set()
+
+    # Parse Daily
     for i, row in enumerate(daily_vals):
         if not row or not row[0]: continue
         c0 = str(row[0]).strip()
@@ -447,7 +456,7 @@ def main():
             if k not in ["CR", "Change"]:
                 existing_tracker[k] = {"type": "daily", "row": i + 1, "status": row[8].strip() if len(row) > 8 else ""}
 
-    # Map existing weekend entries
+    # Parse Weekend
     weekend_sunday_row = None
     if weekend_vals:
         for i, row in enumerate(weekend_vals):
@@ -458,7 +467,7 @@ def main():
             if k not in ["Change", "CR", "Saturday", "Sunday"]:
                 existing_tracker[k] = {"type": "weekend", "row": i + 1, "status": row[7].strip() if len(row) > 7 else ""}
 
-    # 5. Group tickets by Destination & Date strictly using Planned Start
+    # 5. Group Tickets by Date and Destination
     daily_grouped_new = {}
     weekend_new_tickets = []
 
@@ -470,7 +479,7 @@ def main():
         t_info = reviewed_dict[key]
         planned_dt = issue_date_map[key]
         date_str = planned_dt.strftime("%d/%m/%Y")
-        weekday_idx = planned_dt.weekday() # 5 = Sat, 6 = Sun
+        weekday_idx = planned_dt.weekday() # 5 = Saturday, 6 = Sunday
         is_weekend = weekday_idx >= 5
         j_stat = issue.fields.status.name
 
@@ -498,7 +507,7 @@ def main():
         # Ingest New Ticket: Weekend vs Daily
         if is_weekend and weekend_sheet_id:
             w_section = "Saturday" if weekday_idx == 5 else "Sunday"
-            print(f"🗓️ Ingesting {key} ({date_str}) into Weekend Sheet under {w_section}...")
+            print(f"🗓️ Ingesting {key} -> Weekend Sheet under {w_section} (Planned: {date_str})...")
             weekend_row = [
                 cr_hyperlink, env, type_val, clean_desc, app_name,
                 "TOC", "TOC", "Pending", "Pending", impl, "10:00:00", ""
@@ -506,7 +515,7 @@ def main():
             weekend_new_tickets.append((w_section, weekend_row))
             existing_tracker[key] = {"type": "weekend", "status": "Pending"}
         else:
-            print(f"📅 Ingesting {key} ({date_str}) into Daily Changes Sheet...")
+            print(f"📅 Ingesting {key} -> Daily Changes Sheet ({date_str})...")
             daily_row = [
                 date_str, cr_hyperlink, env, type_val, app_name,
                 clean_desc, impl, "10:00:00", j_stat
@@ -516,9 +525,13 @@ def main():
             daily_grouped_new[date_str].append(daily_row)
             existing_tracker[key] = {"type": "daily", "status": j_stat}
 
-    # 6. Ingest Grouped Daily Blocks (Clean, Beautiful, Consolidated)
+    # 6. Write Grouped Daily Blocks
     current_daily_len = len(daily_vals)
-    for date_str, rows in daily_grouped_new.items():
+    # Sort dates chronologically
+    sorted_dates = sorted(daily_grouped_new.keys(), key=lambda d: datetime.strptime(d, "%d/%m/%Y"))
+
+    for date_str in sorted_dates:
+        rows = daily_grouped_new[date_str]
         if date_str in existing_daily_dates:
             print(f"📝 Appending {len(rows)} row(s) to existing block for {date_str}...")
             engine.append_rows(DAILY_SHEET_ID, DAILY_TAB_NAME, rows)
@@ -529,7 +542,7 @@ def main():
             current_daily_len += len(rows) + 3
             existing_daily_dates.add(date_str)
 
-    # 7. Ingest Weekend Tickets
+    # 7. Write Weekend Tickets
     for w_section, row_data in weekend_new_tickets:
         if w_section == "Saturday" and weekend_sunday_row:
             engine.insert_row_at(weekend_sheet_id, "Sheet1", row_data, weekend_sunday_row)
@@ -538,7 +551,7 @@ def main():
             engine.append_rows(weekend_sheet_id, "Sheet1", [row_data])
         print(f"🗓️ Inserted weekend change into {w_section}.")
 
-    # 8. Status Transition Detection & Working Hours Gate (9 AM to 9 PM IST)
+    # 8. Status Transition Detection & Working Hours Gate (9:00 AM - 9:00 PM IST)
     prev_cache = {}
     if os.path.exists(STATE_CACHE_FILE):
         try:
