@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from jira import JIRA
@@ -17,7 +18,7 @@ JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
-# High-recall JQL: Captures your team + all Traiana / TOC release projects over the next 10 days
+# Strict JQL bounded to active changes from today through the next 10 days
 JQL_QUERY = os.getenv(
     "JQL_QUERY",
     """
@@ -44,10 +45,8 @@ DAILY_TAB_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Daily Changes")
 STATE_CACHE_FILE = "sheet_last_status_cache.json"
 IST = timezone(timedelta(hours=5, minutes=30))
 
-TOC_TEAM_MEMBERS = ["Gaurav Raghav", "Chandan Kumar", "Kamaldeep Singh", "Rahul Dev Jha", "Parthiv Upreti"]
-
 # ==============================================================================
-# 1. JIRA SERVICE
+# 1. JIRA SERVICE (EXACT METADATA DATE EXTRACTION)
 # ==============================================================================
 class JiraClient:
     def __init__(self):
@@ -58,124 +57,116 @@ class JiraClient:
 
     def fetch_candidates(self):
         try:
-            print("🔍 Fetching active and upcoming candidate changes from Jira...")
+            print("🔍 Fetching active and upcoming change tickets from Jira...")
             return self.client.search_issues(JQL_QUERY, maxResults=60, fields=['*all'])
         except Exception as e:
             print(f"❌ Jira query error: {e}", file=sys.stderr)
             return []
 
+    def get_iso_planned_date(self, issue):
+        """
+        Extracts the EXACT Planned Start timestamp from Jira metadata.
+        Never guesses from summary text.
+        """
+        raw = issue.raw.get('fields', {})
+        for field_name in ["customfield_11400", "customfield_10015", "plannedstart", "customfield_10020"]:
+            val = raw.get(field_name)
+            if val and isinstance(val, str) and len(val) >= 10:
+                return val
+
+        # Fallback to created date
+        return str(getattr(issue.fields, "created", ""))
+
 # ==============================================================================
-# 2. VERTEX AI (GEMINI 2.5 FLASH) INTELLIGENT TOC THINKER
+# 2. DATE PARSER (CONVERTS JIRA TIMESTAMP TO IST DD/MM/YYYY)
 # ==============================================================================
-class SeniorTOCOperationsAI:
+def parse_jira_date_to_ist(iso_string):
+    """
+    Parses '2026-09-29T12:00:00.000+0530' or '2026-09-29' into an IST datetime object.
+    """
+    if not iso_string:
+        return datetime.now(IST)
+
+    clean_str = iso_string.split('.')[0] # Remove milliseconds
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+        try:
+            dt = datetime.strptime(clean_str[:len(fmt) + 2], fmt)
+            return dt.replace(tzinfo=IST)
+        except Exception:
+            pass
+    try:
+        dt = datetime.strptime(iso_string[:10], "%Y-%m-%d")
+        return dt.replace(tzinfo=IST)
+    except Exception:
+        return datetime.now(IST)
+
+# ==============================================================================
+# 3. VERTEX AI (GEMINI 2.5 FLASH) INTELLIGENT TOC EVALUATOR
+# ==============================================================================
+class SeniorTOCReviewer:
     def __init__(self, project_id, location):
         vertexai.init(project=project_id, location=location)
-        # Using Gemini 2.5 Flash for high reasoning quality and speed
         self.model = GenerativeModel("gemini-2.5-flash")
-        print("⚡ Vertex AI (Gemini 2.5 Flash) Senior TOC Thinker initialized.")
+        print("⚡ Vertex AI (Gemini 2.5 Flash) Reviewer initialized.")
 
-    def evaluate_and_route_tickets(self, jira_issues, today_date_str):
-        serialized = []
-        for issue in jira_issues:
-            raw = issue.raw.get('fields', {})
-            p_start = (
-                raw.get("customfield_10015") or 
-                raw.get("plannedstart") or 
-                raw.get("customfield_11400") or 
-                str(getattr(issue.fields, "created", ""))
-            )
-            assignee = issue.fields.assignee.displayName if issue.fields.assignee else "Unassigned"
-            summary = issue.fields.summary or ""
-            desc = (issue.fields.description or "")[:350]
-            services = raw.get("services") or raw.get("affectedServices") or raw.get("components") or ""
-
-            serialized.append({
-                "key": issue.key,
-                "project": issue.fields.project.key,
-                "summary": summary,
-                "status": issue.fields.status.name,
-                "assignee": assignee,
-                "reporter": issue.fields.reporter.displayName if issue.fields.reporter else "",
-                "planned_start": p_start,
-                "affected_services": services,
-                "description": desc
-            })
-
-        system_instruction = f"""
-        You are a Senior Technology Operations Centre (TOC) Deployment Engineer at Osttra.
-        Your team consists of: Gaurav Raghav, Chandan Kumar, Kamaldeep Singh, Rahul Dev Jha, Parthiv Upreti.
-        Today's Reference Date: {today_date_str} (IST)
-
-        Evaluate each Jira ticket and act as a critical human filter:
+    def evaluate_and_clean_tickets(self, raw_candidates):
+        """
+        Gemini acts as the TOC engineer:
+        - Drops pure DBA segregation / network / non-TOC changes
+        - Cleans up the summary/description into a single readable line (no massive markdown tables)
+        - Normalizes Application name to clean dropdown standard
+        """
+        system_instruction = """
+        You are a Senior TOC Deployment Engineer at Osttra.
+        Review these deployment change tickets.
         
-        RULE 1: IS THIS A REAL TOC APPLICATION DEPLOYMENT?
-        - KEEP: Software release, application deployment, patch release, hotfix, transform update, config standardization, JVM tuning, go-live, or microservice release across our application stack (TradeSTP, LimitHub, ETD, EQ, CFS, HAR/CL, Harmony, SocGen, IC-SA, DealHub, CCPC, MW, AAS, ODC, Cashflow).
-        - KEEP EVEN IF NOT ASSIGNED TO OUR TEAM YET: If a ticket is currently assigned to a Scrum Master, QA, or requester (e.g. Surbhi Bansal, Monika Saini, Ankit Agrawal, Rajendra Prasad, Ravi Goyal), but it represents an application release or deployment task that TOC executes, KEEP IT! Map implementor to the assignee or 'TOC'.
-        - DISCARD / EXCLUDE: 
-          * Pure Database administration tasks owned strictly by DBAs (e.g., 'TRMPLATFORM-10064 JPTRM database segregation in Production' or DB migrations where DBA is implementor and TOC has no application task).
-          * Infrastructure network cabling, AWS secrets generation, or non-deployment Jira tickets.
-
-        RULE 2: EXTRACTION & ROUTING
-        - Extract the exact scheduled date in 'DD/MM/YYYY' format from 'planned_start' or summary.
-        - Destination Routing:
-          * "daily": Monday through Friday releases -> go to Daily Changes sheet.
-          * "weekend": Saturday or Sunday releases -> go to Weekend sheet.
-        - If "weekend", specify "weekend_section": "Saturday" or "Sunday".
-        - Map "application" to a clean dropdown value:
-          ("TradeSTP", "LimitHub", "ETD", "EQ", "CFS", "HAR", "Harmony", "SocGen", "IC SA", "DealHub", "CCPC", "MW", "AAS", "ODC", "Cashflow", "CL").
-        - Determine "env": "PROD", "UAT", "DR", or "PROD DR".
-        - Format "type": "Upload", "Normal", or "SC".
+        RULES:
+        1. FILTER:
+           - KEEP: Application deployments, patch releases, transform updates, JVM flags, config changes, go-lives across Osttra applications.
+           - DROP: Pure DBA tasks (e.g., 'JPTRM database segregation' where DBA is owner and TOC has no application deployment role), network cabling, or Jira admin tasks.
+        2. CLEAN DESCRIPTION:
+           - Create a clean, single-line summary (MAX 120 characters).
+           - Remove massive markdown runbooks, release note URLs, or multi-line tables. Keep only the essence of the change.
+        3. APPLICATION:
+           - Return clean short application name: ("TradeSTP", "LimitHub", "ETD", "EQ", "CFS", "HAR", "Harmony", "SocGen", "IC SA", "DealHub", "CCPC", "MW", "AAS", "ODC", "Cashflow", "CL", "TS").
+        4. ENV: "PROD", "UAT", "DR", or "PROD DR".
+        5. TYPE: "Upload", "Normal", or "SC".
 
         OUTPUT STRICT JSON ONLY:
-        {{
-            "accepted_tickets": [
-                {{
+        {
+            "reviewed_tickets": [
+                {
                     "key": "...",
-                    "target": "daily" or "weekend",
-                    "date_str": "DD/MM/YYYY",
-                    "weekend_section": "Saturday" or "Sunday" or null,
+                    "is_toc_deployment": true or false,
+                    "application": "...",
+                    "clean_description": "...",
                     "env": "...",
                     "type": "...",
-                    "application": "...",
-                    "description": "...",
                     "implementor": "...",
-                    "start_time": "10:00:00",
-                    "status": "...",
-                    "reason_accepted": "..."
-                }}
-            ],
-            "excluded_tickets": [
-                {{
-                    "key": "...",
-                    "reason_excluded": "e.g. DBA owned task / Not TOC deployment"
-                }}
+                    "status": "..."
+                }
             ]
-        }}
+        }
         """
 
-        prompt = f"Raw Tickets:\n{json.dumps(serialized, indent=2)}"
+        prompt = f"Raw Candidates:\n{json.dumps(raw_candidates, indent=2)}"
 
         try:
             resp = self.model.generate_content(
                 f"{system_instruction}\n\n{prompt}",
                 generation_config=GenerationConfig(
                     response_mime_type="application/json",
-                    temperature=0.1
+                    temperature=0.0
                 )
             )
             data = json.loads(resp.text.strip())
-            accepted = data.get("accepted_tickets", [])
-            excluded = data.get("excluded_tickets", [])
-            print(f"🎯 AI Decision: Accepted {len(accepted)} TOC deployment changes | Filtered out {len(excluded)} non-TOC items.")
-            for ex in excluded:
-                print(f"   🚫 Discarded {ex.get('key')}: {ex.get('reason_excluded')}")
-            return accepted
+            return data.get("reviewed_tickets", [])
         except Exception as e:
-            print(f"❌ AI Thinker Error: {e}", file=sys.stderr)
+            print(f"❌ AI Reviewer Error: {e}", file=sys.stderr)
             return []
 
 # ==============================================================================
-# 3. GOOGLE SHEETS & DRIVE ENGINE
+# 4. GOOGLE SHEETS & DRIVE ENGINE (ELEGANT GROUPED FORMATTING)
 # ==============================================================================
 class GoogleSheetEngine:
     def __init__(self):
@@ -254,11 +245,11 @@ class GoogleSheetEngine:
         ).execute()
 
     def create_vibrant_date_block(self, sheet_id, tab_name, date_str, rows_to_add, start_row_1_based):
-        """Creates a vibrant, polished date block with styled headers and crisp gridlines."""
+        """Creates a professional, grouped date block with no stray dropdowns."""
         s_id_num = self.get_sheet_id_num(sheet_id, tab_name)
         block_rows = [
-            [], # Empty spacer row
-            [date_str] + [""] * 8, # Row A: Date Banner
+            [], # Empty spacer
+            [date_str] + [""] * 8, # Row A: Merged Date Banner
             ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status'] # Row B: Header Row
         ] + rows_to_add
 
@@ -304,7 +295,7 @@ class GoogleSheetEngine:
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # 3. Clear Data Validation (No Dropdowns) from Banner
+            # 3. Clear Data Validation from Date Banner
             {
                 "setDataValidation": {
                     "range": {
@@ -338,7 +329,7 @@ class GoogleSheetEngine:
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
                 }
             },
-            # 5. Clear Data Validation from Column Header Row
+            # 5. Clear Data Validation from Header Row
             {
                 "setDataValidation": {
                     "range": {
@@ -378,50 +369,68 @@ class GoogleSheetEngine:
         self.sheets_api.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body=body).execute()
 
 # ==============================================================================
-# 4. MAIN ORCHESTRATION CYCLE
+# 5. MAIN ORCHESTRATION CYCLE
 # ==============================================================================
 def main():
     now_ist = datetime.now(IST)
-    today_date_str = now_ist.strftime("%d/%m/%Y")
     print(f"\n=======================================================")
     print(f"  AI-POWERED TOC RELEASE TRACKER | {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
     print(f"=======================================================")
 
     jira = JiraClient()
-    ai_thinker = SeniorTOCOperationsAI(GCP_PROJECT_ID, GCP_LOCATION)
+    ai_reviewer = SeniorTOCReviewer(GCP_PROJECT_ID, GCP_LOCATION)
     engine = GoogleSheetEngine()
 
-    # 1. Fetch raw candidates
+    # 1. Fetch from Jira
     jira_issues = jira.fetch_candidates()
     if not jira_issues:
         print("No active candidates in Jira. Exiting.")
         return
 
-    # 2. Run Gemini 2.5 Flash Thinking Engine to evaluate & filter
-    smart_tickets = ai_thinker.evaluate_and_route_tickets(jira_issues, today_date_str)
-    print(f"🧠 Accepted {len(smart_tickets)} legitimate TOC release changes.")
+    # 2. Extract EXACT metadata dates directly from Jira fields
+    issue_date_map = {}
+    serialized_candidates = []
+    for issue in jira_issues:
+        raw_iso = jira.get_iso_planned_date(issue)
+        planned_dt = parse_jira_date_to_ist(raw_iso)
+        issue_date_map[issue.key] = planned_dt
 
-    # 3. Read sheets and map existing state
+        serialized_candidates.append({
+            "key": issue.key,
+            "summary": issue.fields.summary,
+            "status": issue.fields.status.name,
+            "assignee": issue.fields.assignee.displayName if issue.fields.assignee else "TOC",
+            "metadata_planned_date": planned_dt.strftime("%d/%m/%Y"),
+            "description": (issue.fields.description or "")[:300]
+        })
+
+    # 3. Let Gemini evaluate: filter out non-TOC tasks (like DBA) & clean descriptions
+    reviewed_list = ai_reviewer.evaluate_and_clean_tickets(serialized_candidates)
+    reviewed_dict = {t["key"]: t for t in reviewed_list if t.get("is_toc_deployment", True)}
+
+    print(f"🧠 TOC Review Complete: {len(reviewed_dict)} deployment changes approved for sheet tracking.")
+
+    # 4. Read existing sheets to map current state and protect manual edits
     daily_vals = engine.read_sheet(DAILY_SHEET_ID, DAILY_TAB_NAME)
     weekend_sheet_id, weekend_name = engine.resolve_weekend_sheet_id(now_ist)
     weekend_vals = engine.read_sheet(weekend_sheet_id, "Sheet1") if weekend_sheet_id else []
 
     existing_tracker = {}
 
-    # Parse Daily
-    daily_block_start = {}
+    # Map existing daily entries
+    existing_daily_dates = set()
     for i, row in enumerate(daily_vals):
         if not row or not row[0]: continue
         c0 = str(row[0]).strip()
         if '/' in c0 or '-' in c0:
-            daily_block_start[c0] = i + 1
+            existing_daily_dates.add(c0)
         if len(row) > 1 and row[1]:
             raw_k = str(row[1]).strip()
             k = raw_k.split('", "')[-1].replace('")', '').strip() if '", "' in raw_k else raw_k
             if k not in ["CR", "Change"]:
                 existing_tracker[k] = {"type": "daily", "row": i + 1, "status": row[8].strip() if len(row) > 8 else ""}
 
-    # Parse Weekend
+    # Map existing weekend entries
     weekend_sunday_row = None
     if weekend_vals:
         for i, row in enumerate(weekend_vals):
@@ -432,62 +441,85 @@ def main():
             if k not in ["Change", "CR", "Saturday", "Sunday"]:
                 existing_tracker[k] = {"type": "weekend", "row": i + 1, "status": row[7].strip() if len(row) > 7 else ""}
 
-    # 4. Ingest Accepted Tickets
-    for item in smart_tickets:
-        k = item["key"]
-        j_stat = item.get("status", "Pending")
-        target = item.get("target", "daily")
-        date_str = item.get("date_str", today_date_str)
-        cr_hyperlink = f'=HYPERLINK("{JIRA_SERVER}/browse/{k}", "{k}")'
+    # 5. Group tickets by Destination & Date
+    daily_grouped_new = {}   # { "29/09/2026": [rows...] }
+    weekend_new_tickets = [] # [ (weekend_section, row)... ]
 
-        # Rule: Ticket already exists -> Check bi-directional completion sync, never overwrite manual edits
-        if k in existing_tracker:
-            info = existing_tracker[k]
+    for issue in jira_issues:
+        key = issue.key
+        if key not in reviewed_dict:
+            continue # Discarded by AI filter
+
+        t_info = reviewed_dict[key]
+        planned_dt = issue_date_map.get(key, now_ist)
+        date_str = planned_dt.strftime("%d/%m/%Y")
+        weekday_idx = planned_dt.weekday() # 5 = Sat, 6 = Sun
+        is_weekend = weekday_idx >= 5
+        j_stat = issue.fields.status.name
+
+        cr_hyperlink = f'=HYPERLINK("{JIRA_SERVER}/browse/{key}", "{key}")'
+        clean_desc = t_info.get("clean_description") or issue.fields.summary
+        clean_desc = re.sub(r'[\r\n]+', ' ', clean_desc).strip() # Ensure single-line clean description
+        app_name = t_info.get("application", "")
+        env = t_info.get("env", "PROD")
+        type_val = t_info.get("type", "Normal")
+        impl = t_info.get("implementor") or (issue.fields.assignee.displayName if issue.fields.assignee else "TOC")
+
+        # Bi-directional completion sync if ticket already exists
+        if key in existing_tracker:
+            info = existing_tracker[key]
             s_stat = str(info["status"]).strip().lower()
             if j_stat.lower() in ["completed", "closed", "resolved", "done"] and s_stat not in ["done", "completed"]:
-                print(f"🔄 Bi-directional Sync: Updating sheet status for {k} to 'Done'...")
+                print(f"🔄 Bi-directional Sync: Updating sheet status for {key} to 'Done'...")
                 if info["type"] == "daily":
                     engine.update_cell(DAILY_SHEET_ID, DAILY_TAB_NAME, f"I{info['row']}", "Done")
                 elif weekend_sheet_id:
                     engine.update_cell(weekend_sheet_id, "Sheet1", f"H{info['row']}", "Done")
-                existing_tracker[k]["status"] = "Done"
+                existing_tracker[key]["status"] = "Done"
             continue
 
-        # Ingest New Ticket: Weekend vs Daily
-        if target == "weekend" and weekend_sheet_id:
-            w_section = item.get("weekend_section", "Saturday")
-            print(f"🗓️ Ingesting {k} into Weekend Sheet ({w_section})...")
+        # Prepare new row
+        if is_weekend and weekend_sheet_id:
+            w_section = "Saturday" if weekday_idx == 5 else "Sunday"
             weekend_row = [
-                cr_hyperlink, item.get("env", "PROD"), item.get("type", "Normal"),
-                item.get("description", ""), item.get("application", ""),
-                "TOC", "TOC", "Pending", "Pending", item.get("implementor", "TOC"),
-                item.get("start_time", "10:00:00"), ""
+                cr_hyperlink, env, type_val, clean_desc, app_name,
+                "TOC", "TOC", "Pending", "Pending", impl, "10:00:00", ""
             ]
-            if w_section == "Saturday" and weekend_sunday_row:
-                engine.insert_row_at(weekend_sheet_id, "Sheet1", weekend_row, weekend_sunday_row)
-                weekend_sunday_row += 1
-            else:
-                engine.append_rows(weekend_sheet_id, "Sheet1", [weekend_row])
-            existing_tracker[k] = {"type": "weekend", "status": "Pending"}
-
+            weekend_new_tickets.append((w_section, weekend_row))
+            existing_tracker[key] = {"type": "weekend", "status": "Pending"}
         else:
-            print(f"📅 Ingesting {k} into Daily Changes Sheet ({date_str})...")
             daily_row = [
-                date_str, cr_hyperlink, item.get("env", "PROD"),
-                item.get("type", "Upload"), item.get("application", ""),
-                item.get("description", ""), item.get("implementor", "TOC"),
-                item.get("start_time", "10:00:00"), j_stat
+                date_str, cr_hyperlink, env, type_val, app_name,
+                clean_desc, impl, "10:00:00", j_stat
             ]
-            if date_str in daily_block_start:
-                engine.append_rows(DAILY_SHEET_ID, DAILY_TAB_NAME, [daily_row])
-            else:
-                print(f"Creating polished vibrant date block for {date_str}...")
-                engine.create_vibrant_date_block(DAILY_SHEET_ID, DAILY_TAB_NAME, date_str, [daily_row], len(daily_vals))
-                daily_block_start[date_str] = len(daily_vals) + 2
+            if date_str not in daily_grouped_new:
+                daily_grouped_new[date_str] = []
+            daily_grouped_new[date_str].append(daily_row)
+            existing_tracker[key] = {"type": "daily", "status": j_stat}
 
-            existing_tracker[k] = {"type": "daily", "status": j_stat}
+    # 6. Ingest Grouped Daily Blocks (Clean, Beautiful, Consolidated)
+    current_daily_len = len(daily_vals)
+    for date_str, rows in daily_grouped_new.items():
+        if date_str in existing_daily_dates:
+            print(f"📝 Appending {len(rows)} row(s) to existing block for {date_str}...")
+            engine.append_rows(DAILY_SHEET_ID, DAILY_TAB_NAME, rows)
+            current_daily_len += len(rows)
+        else:
+            print(f"🎨 Creating vibrant date block for {date_str} ({len(rows)} tickets)...")
+            engine.create_vibrant_date_block(DAILY_SHEET_ID, DAILY_TAB_NAME, date_str, rows, current_daily_len)
+            current_daily_len += len(rows) + 3
+            existing_daily_dates.add(date_str)
 
-    # 5. Status Transition Tracking & Working Hours Gate
+    # 7. Ingest Weekend Tickets
+    for w_section, row_data in weekend_new_tickets:
+        if w_section == "Saturday" and weekend_sunday_row:
+            engine.insert_row_at(weekend_sheet_id, "Sheet1", row_data, weekend_sunday_row)
+            weekend_sunday_row += 1
+        else:
+            engine.append_rows(weekend_sheet_id, "Sheet1", [row_data])
+        print(f"🗓️ Inserted weekend change into {w_section}.")
+
+    # 8. Status Transition Detection & Working Hours Gate (9 AM to 9 PM IST)
     prev_cache = {}
     if os.path.exists(STATE_CACHE_FILE):
         try:
@@ -499,18 +531,16 @@ def main():
         curr_s = v["status"].strip().lower()
         prev_s = prev_cache.get(k, "").strip().lower()
         if curr_s and prev_s and curr_s != prev_s:
-            print(f"⚡ Status Transition: {k} went from '{prev_s}' -> '{curr_s}'")
+            print(f"⚡ Status Transition: {k} changed from '{prev_s}' -> '{curr_s}'")
             status_changed = True
 
     with open(STATE_CACHE_FILE, "w") as f:
         json.dump({k: v["status"] for k, v in existing_tracker.items()}, f)
 
-    # Working Window Protection: 9:00 AM to 9:00 PM IST
     is_working_hours = (9 <= now_ist.hour < 21)
-
     if status_changed:
         if is_working_hours:
-            print("🚀 Working hours active (09:00 - 21:00 IST). Triggering Chat broadcast immediately...")
+            print("🚀 Inside working hours (09:00 - 21:00 IST). Triggering Chat broadcast immediately...")
             subprocess.run(["python", "chat_broadcast_bot.py"], check=False)
         else:
             print(f"🌙 Outside working window ({now_ist.strftime('%H:%M IST')}). Chat broadcast suppressed.")
