@@ -1,611 +1,442 @@
 import os
 import sys
 import json
+import csv
+import re
+from io import StringIO
 from datetime import datetime, timedelta, timezone
-import requests
-from jira import JIRA
 
 import google.auth
 from googleapiclient.discovery import build
 import vertexai
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+import requests
+from jira import JIRA
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "prj-s-ai-bot-4rl8")
+LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+IST = timezone(timedelta(hours=5, minutes=30))
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+SHEET_FILE_ID = os.getenv("GOOGLE_SHEET_FILE_ID", "1NwJd8uzGIcDTxE0XJ_VYbqJfQnjuqxB4wh5UR97SIlk")
+
 JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
-JQL_QUERY = os.getenv(
-    "JQL_QUERY",
-    """
-    (worktype = Change OR issuetype = Change)
-    AND assignee IN ("Gaurav Raghav", "Chandan Kumar", "Kamaldeep Singh", "Rahul Dev Jha")
-    AND "Planned start" >= startOfDay() AND "Planned start" <= endOfDay()
-    ORDER BY "Planned start" ASC
-    """
-)
+STATE_FILE = "last_run_state.txt"       # Tracks if wrap-up was sent
+FIRST_RUN_FILE = "first_run_state.txt" # Tracks first morning broadcast
 
-GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "prj-s-ai-bot-4rl8")
-GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-
-GOOGLE_SHEET_FILE_ID = os.getenv("GOOGLE_SHEET_FILE_ID", "1NwJd8uzGIcDTxE0XJ_VYbqJfQnjuqxB4wh5UR97SIlk")
-GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Daily Changes")
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-IST = timezone(timedelta(hours=5, minutes=30))
-
-DONE_STATUSES = {"done", "completed", "closed", "resolved", "implemented successfully", "success"}
-IN_PROGRESS_STATUSES = {"in progress", "work in progress", "implementing", "started", "awaiting implementation"}
-
-# Known dropdown options in your Google Sheet (from input_file_22.png)
-KNOWN_APPS = [
-    "IC SA", "TradeSTP", "DealHub", "LimitHub", "MW", "OTM", "TN", "Transformers",
-    "STPaaS", "FXBA", "Traiana", "Adapter", "CCPC", "JSW", "H5/CL", "CRDS", "H3",
-    "DNM", "SSO", "CSM", "CFD", "ODC", "EQ", "Cashflow", "LH", "CreditLink",
-    "SocGen", "SCB", "ETD", "Baton", "AAS", "DMS", "SIGMA", "HSBC TRM", "IC LH UI",
-    "Alpine", "CITI TRM", "Apigee", "Jigsaw", "DB TRM", "BOFA TRM", "CFS", "JPTRM",
-    "NextGen Citi", "UBS", "ZKB", "BNPP", "3C", "WFM", "H4", "CLFX"
-]
+DONE_STATUSES = {"done", "completed", "closed", "resolved", "implemented", "success"}
+IN_PROGRESS_STATUSES = {"in progress", "work in progress", "implementing", "started", "review"}
 
 # ==============================================================================
-# JIRA SERVICE (WITH DYNAMIC AFFECTED SERVICES EXTRACTION)
+# 1. JIRA DEEP CONTEXT SERVICE
 # ==============================================================================
-class JiraService:
-    def __init__(self, server, email, token):
+class JiraContextService:
+    def __init__(self):
         self.client = None
-        if not email or not token:
-            print("❌ ERROR: JIRA_EMAIL or JIRA_API_TOKEN is missing!", file=sys.stderr)
-            sys.exit(1)
+        if JIRA_EMAIL and JIRA_API_TOKEN:
+            try:
+                self.client = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
+                print("✅ Connected to Jira REST API for deep context extraction.")
+            except Exception as e:
+                print(f"⚠️ Jira connection warning: {e}. Falling back to sheet-only context.")
+
+    def fetch_ticket_deep_context(self, ticket_key):
+        """Fetches raw ticket data, summary, status, and the latest comments."""
+        if not self.client:
+            return None
         try:
-            self.client = JIRA(server=server, basic_auth=(email, token))
-            print("✅ Successfully connected to Jira.")
+            issue = self.client.issue(ticket_key, fields=['summary', 'description', 'status', 'assignee', 'comment', 'priority'])
+            comments = []
+            if hasattr(issue.fields, 'comment') and issue.fields.comment:
+                for c in (issue.fields.comment.comments or [])[-4:]:
+                    author = getattr(c.author, 'displayName', 'Team')
+                    body_clean = re.sub(r'[\r\n]+', ' ', c.body).strip()
+                    comments.append(f"[{author}]: {body_clean[:200]}")
+
+            return {
+                "key": issue.key,
+                "summary": issue.fields.summary,
+                "jira_status": issue.fields.status.name,
+                "jira_assignee": issue.fields.assignee.displayName if issue.fields.assignee else "TOC",
+                "comments": comments,
+                "description": (issue.fields.description or "")[:350]
+            }
         except Exception as e:
-            print(f"❌ ERROR: Could not connect to Jira: {e}", file=sys.stderr)
-            sys.exit(1)
+            print(f"⚠️ Could not fetch Jira context for {ticket_key}: {e}")
+            return None
 
-    def extract_affected_service(self, issue):
-        """
-        Extracts the 'Affected services' field from Jira issue data.
-        Falls back to summary inspection matching your sheet's dropdowns.
-        """
-        raw_fields = issue.raw.get('fields', {})
+# ==============================================================================
+# 2. SHEET EXTRACTION ENGINE (SHEET IS SOURCE OF TRUTH)
+# ==============================================================================
+def extract_ticket_key(raw_cell):
+    """Extracts raw key like 'MSERV-660' from plain text or =HYPERLINK formulas."""
+    cell = str(raw_cell).strip()
+    if '", "' in cell:
+        return cell.split('", "')[-1].replace('")', '').strip()
+    elif '",' in cell:
+        return cell.split('",')[-1].replace(')', '').replace('"', '').strip()
+    return cell
 
-        # 1. Direct standard field check
-        for attr in ['services', 'affectedServices', 'components']:
-            val = raw_fields.get(attr)
-            if val and isinstance(val, list):
-                for item in val:
-                    name = item.get('name') if isinstance(item, dict) else str(item)
-                    if name:
-                        for app in KNOWN_APPS:
-                            if app.lower() == name.lower():
-                                return app
-                        return name
+def get_today_deployments_from_sheet():
+    print("🔍 Authenticating via ADC and querying active deployment sheet...")
+    scopes = [
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/cloud-platform'
+    ]
+    credentials, _ = google.auth.default(scopes=scopes)
 
-        # 2. Iterate all custom fields to find the 'Affected services' object
-        for k, v in raw_fields.items():
-            if not v:
-                continue
-            # Look inside list of dicts (standard for service management assets)
-            if isinstance(v, list):
-                for item in v:
-                    if isinstance(item, dict):
-                        name = item.get('name') or item.get('value')
-                        if name:
-                            for app in KNOWN_APPS:
-                                if app.lower() == str(name).lower():
-                                    return app
-            # Look inside single dict
-            elif isinstance(v, dict):
-                name = v.get('name') or v.get('value')
-                if name:
-                    for app in KNOWN_APPS:
-                        if app.lower() == str(name).lower():
-                            return app
+    try:
+        drive_service = build('drive', 'v3', credentials=credentials)
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR: Failed to connect to Drive API: {e}", file=sys.stderr)
+        sys.exit(1)
 
-        # 3. Fallback: Deduce from Summary or Description
-        text = (issue.fields.summary or "") + " " + (issue.fields.description or "")
-        for app in KNOWN_APPS:
-            if f" {app.lower()} " in f" {text.lower()} " or app.lower() in text.lower():
-                return app
+    now_ist = datetime.now(IST)
+    is_weekend = now_ist.weekday() >= 5
+    target_file_id = SHEET_FILE_ID
 
-        return ""
+    # Weekend Sheet dynamic lookup
+    if is_weekend:
+        if now_ist.weekday() == 5:
+            sat_date = now_ist
+            sun_date = now_ist + timedelta(days=1)
+        else:
+            sat_date = now_ist - timedelta(days=1)
+            sun_date = now_ist
 
-    def get_planned_changes(self):
-        try:
-            print("🔍 Querying Jira for today's planned changes...")
-            issues = self.client.search_issues(
-                JQL_QUERY,
-                maxResults=50,
-                fields=['*all']  # Fetch all custom fields so Affected Services is included
-            )
-            print(f" Jira found {len(issues)} planned ticket(s).")
-            return issues
-        except Exception as e:
-            print(f"❌ ERROR: Failed to query Jira: {e}", file=sys.stderr)
+        weekend_filename = f"{sat_date.strftime('%d-%m-%Y')} & {sun_date.strftime('%d-%m-%Y')}"
+        print(f"🗓️ Weekend active! Resolving sheet: '{weekend_filename}'")
+        q = f"name contains '{weekend_filename}' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false"
+        res = drive_service.files().list(q=q, fields="files(id, name)").execute()
+        files = res.get('files', [])
+        if not files:
+            print(f"⚠️ Weekend tracker file '{weekend_filename}' not found. Exiting.")
             return []
+        target_file_id = files[0]['id']
+        print(f"✅ Found weekend tracker: {files[0]['name']}")
+    else:
+        print(f"📅 Daily operations active. Reading daily changes sheet...")
 
-# ==============================================================================
-# GOOGLE SHEETS SERVICE WITH CLEAN FORMATTING & HYPERLINKING
-# ==============================================================================
-class GoogleSheetService:
-    def __init__(self, spreadsheet_id, sheet_name):
-        self.spreadsheet_id = spreadsheet_id
-        self.sheet_name = sheet_name
-        try:
-            print("Authenticating to Google Sheets using ADC...")
-            scopes = [
-                'https://www.googleapis.com/auth/spreadsheets',
-                'https://www.googleapis.com/auth/drive'
-            ]
-            self.credentials, _ = google.auth.default(scopes=scopes)
-            self.service = build('sheets', 'v4', credentials=self.credentials)
-            self.sheet_id_num = self._get_sheet_id_num()
-            print("✅ Successfully connected to Google Sheets API.")
-        except Exception as e:
-            print(f"❌ ERROR: Failed to build Sheets API client: {e}", file=sys.stderr)
-            sys.exit(1)
+    # Export sheet as CSV
+    try:
+        resp = drive_service.files().export_media(fileId=target_file_id, mimeType='text/csv').execute()
+        reader = csv.reader(StringIO(resp.decode('utf-8')))
+        values = list(reader)
+    except Exception as e:
+        print(f"❌ Failed to download sheet CSV: {e}", file=sys.stderr)
+        return []
 
-    def _get_sheet_id_num(self):
-        metadata = self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
-        for s in metadata.get('sheets', []):
-            if s.get("properties", {}).get("title") == self.sheet_name:
-                return s.get("properties", {}).get("sheetId")
-        return 0
+    if not values:
+        return []
 
-    def get_all_values(self):
-        range_name = f"'{self.sheet_name}'!A:Z"
-        res = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id, range=range_name
-        ).execute()
-        return res.get('values', [])
+    parsed_deployments = []
 
-    def append_rows(self, rows_data):
-        range_name = f"'{self.sheet_name}'!A:A"
-        res = self.service.spreadsheets().values().append(
-            spreadsheetId=self.spreadsheet_id,
-            range=range_name,
-            valueInputOption='USER_ENTERED',
-            insertDataOption='INSERT_ROWS',
-            body={'values': rows_data}
-        ).execute()
-        return res
+    if is_weekend:
+        today_day_name = now_ist.strftime("%A") # "Saturday" or "Sunday"
+        current_block = None
 
-    def insert_rows_at(self, rows_data, start_row_index_1_based):
-        start_0 = start_row_index_1_based - 1
-        num_rows = len(rows_data)
+        for row in values:
+            if not row or not any(row): continue
+            clean = [str(c).strip() for c in row if str(c).strip()]
+            if not clean: continue
 
-        body = {
-            "requests": [
-                {
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": self.sheet_id_num,
-                            "dimension": "ROWS",
-                            "startIndex": start_0,
-                            "endIndex": start_0 + num_rows
-                        },
-                        "inheritFromBefore": False
-                    }
-                }
-            ]
-        }
-        self.service.spreadsheets().batchUpdate(
-            spreadsheetId=self.spreadsheet_id, body=body
-        ).execute()
-
-        self.service.spreadsheets().values().update(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"'{self.sheet_name}'!A{start_row_index_1_based}",
-            valueInputOption='USER_ENTERED',
-            body={'values': rows_data}
-        ).execute()
-
-    def parse_sheet_for_today(self, all_values):
-        today_str = datetime.now(IST).strftime("%d/%m/%Y")
-        today_str_alt = datetime.now(IST).strftime("%d/%m/%y")
-
-        today_block_start = -1
-        next_block_start = -1
-        existing_today_tickets = {}
-
-        for idx, row in enumerate(all_values):
-            if not row or not row[0]:
+            if clean[0] in ["Saturday", "Sunday"]:
+                current_block = clean[0]
                 continue
-            cell = str(row[0]).strip()
 
-            if today_str in cell or today_str_alt in cell:
-                if today_block_start == -1:
-                    today_block_start = idx + 1
-            elif today_block_start != -1 and ('/' in cell or '-' in cell):
-                next_block_start = idx + 1
+            # In weekend sheet: Row format is [Change, Env, Type, Description, Impacted App, Implementor, Validator, Impl Status, Validation Status, TOC Owner...]
+            if current_block == today_day_name and len(row) > 7:
+                k = extract_ticket_key(row[0])
+                if k and k not in ["Change", "CR", "Saturday", "Sunday"]:
+                    parsed_deployments.append({
+                        "key": k,
+                        "env": row[1].strip() if len(row) > 1 else "PROD",
+                        "type": row[2].strip() if len(row) > 2 else "Normal",
+                        "desc": row[3].strip() if len(row) > 3 else "",
+                        "app": row[4].strip() if len(row) > 4 else "",
+                        "owner": row[9].strip() if len(row) > 9 and row[9] else (row[5].strip() if len(row) > 5 else "TOC"),
+                        "sheet_status": row[7].strip() if len(row) > 7 else "Pending",
+                        "sheet_comments": row[11].strip() if len(row) > 11 else ""
+                    })
+    else:
+        # Daily sheet matching today's date
+        possible_dates = [
+            now_ist.strftime("%d/%m/%Y"), now_ist.strftime("%d/%m/%y"),
+            now_ist.strftime("%Y-%m-%d"), f"{now_ist.day}/{now_ist.month}/{now_ist.year}"
+        ]
+        today_active = False
+
+        for row in values:
+            if not row or not any(row): continue
+            c0 = str(row[0]).strip()
+            if any(d in c0 for d in possible_dates):
+                today_active = True
+                continue
+            elif today_active and ('/' in c0 or '-' in c0) and not any(d in c0 for d in possible_dates):
                 break
 
-            if today_block_start != -1 and len(row) > 1 and row[1]:
-                # Strip out formula if hyperlinked, e.g. =HYPERLINK("...", "INTU-313")
-                raw_cell = row[1].strip()
-                t_key = raw_cell
-                if '", "' in raw_cell:
-                    t_key = raw_cell.split('", "')[-1].replace('")', '').strip()
-                elif '",' in raw_cell:
-                    t_key = raw_cell.split('",')[-1].replace(')', '').replace('"', '').strip()
-
-                if t_key not in ["CR", "Change"]:
-                    existing_today_tickets[t_key] = {
-                        "row": idx + 1,
-                        "env": row[2].strip() if len(row) > 2 else "",
-                        "type": row[3].strip() if len(row) > 3 else "",
+            # Daily format: [Date, CR, Env, Type, Application, Description, Implementor, Start Time, Status]
+            if today_active and len(row) > 1 and row[1]:
+                k = extract_ticket_key(row[1])
+                if k and k not in ["CR", "Change"]:
+                    parsed_deployments.append({
+                        "key": k,
+                        "env": row[2].strip() if len(row) > 2 else "PROD",
+                        "type": row[3].strip() if len(row) > 3 else "Normal",
                         "app": row[4].strip() if len(row) > 4 else "",
                         "desc": row[5].strip() if len(row) > 5 else "",
-                        "owner": row[6].strip() if len(row) > 6 else "",
-                        "status": row[8].strip() if len(row) > 8 else ""
-                    }
+                        "owner": row[6].strip() if len(row) > 6 else "TOC",
+                        "sheet_status": row[8].strip() if len(row) > 8 else "Pending",
+                        "sheet_comments": ""
+                    })
 
-        insertion_index = next_block_start if next_block_start != -1 else len(all_values) + 1
-        return today_block_start, insertion_index, existing_today_tickets
-
-    def create_clean_today_block(self, rows_to_add, start_row_1_based):
-        today_str = datetime.now(IST).strftime("%d/%m/%Y")
-        all_block_rows = [
-            [],
-            [today_str] + [""] * 8,
-            ['Date', 'CR', 'Env', 'Type', 'Application', 'Description', 'Implementor', 'Start Time', 'Status']
-        ] + rows_to_add
-
-        self.append_rows(all_block_rows)
-
-        banner_row_1 = start_row_1_based + 2
-        header_row_1 = start_row_1_based + 3
-        data_start_row_1 = start_row_1_based + 4
-        data_end_row_1 = data_start_row_1 + len(rows_to_add) - 1
-
-        requests_list = [
-            # A. MERGE Banner Col A-I
-            {
-                "mergeCells": {
-                    "range": {
-                        "sheetId": self.sheet_id_num,
-                        "startRowIndex": banner_row_1 - 1,
-                        "endRowIndex": banner_row_1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": 9
-                    },
-                    "mergeType": "MERGE_ALL"
-                }
-            },
-            # B. Style Banner (Blue fill, White bold text)
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": self.sheet_id_num,
-                        "startRowIndex": banner_row_1 - 1,
-                        "endRowIndex": banner_row_1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": 9
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.29, "green": 0.53, "blue": 0.91},
-                            "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "fontSize": 10},
-                            "horizontalAlignment": "LEFT",
-                            "verticalAlignment": "MIDDLE"
-                        }
-                    },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
-                }
-            },
-            # C. REMOVE DROPDOWNS from Banner Row
-            {
-                "setDataValidation": {
-                    "range": {
-                        "sheetId": self.sheet_id_num,
-                        "startRowIndex": banner_row_1 - 1,
-                        "endRowIndex": banner_row_1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": 9
-                    },
-                    "rule": None
-                }
-            },
-            # D. Style Column Header Row (Dark Navy #0b5394, Bold White)
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": self.sheet_id_num,
-                        "startRowIndex": header_row_1 - 1,
-                        "endRowIndex": header_row_1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": 9
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.04, "green": 0.33, "blue": 0.58},
-                            "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "fontSize": 9},
-                            "horizontalAlignment": "CENTER",
-                            "verticalAlignment": "MIDDLE"
-                        }
-                    },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
-                }
-            },
-            # E. REMOVE DROPDOWNS from Header Row
-            {
-                "setDataValidation": {
-                    "range": {
-                        "sheetId": self.sheet_id_num,
-                        "startRowIndex": header_row_1 - 1,
-                        "endRowIndex": header_row_1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": 9
-                    },
-                    "rule": None
-                }
-            }
-        ]
-
-        self.service.spreadsheets().batchUpdate(
-            spreadsheetId=self.spreadsheet_id, body={"requests": requests_list}
-        ).execute()
-
-        self.format_borders(data_start_row_1, data_end_row_1)
-        print("🎨 Cleaned block: Dropdowns removed from Banner & Headers. Formatted correctly!")
-
-    def format_borders(self, start_row_1, end_row_1):
-        border_spec = {
-            "style": "SOLID",
-            "width": 1,
-            "color": {"red": 0.85, "green": 0.85, "blue": 0.85}
-        }
-        body = {
-            "requests": [
-                {
-                    "updateBorders": {
-                        "range": {
-                            "sheetId": self.sheet_id_num,
-                            "startRowIndex": start_row_1 - 1,
-                            "endRowIndex": end_row_1,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 9
-                        },
-                        "top": border_spec, "bottom": border_spec,
-                        "left": border_spec, "right": border_spec,
-                        "innerHorizontal": border_spec, "innerVertical": border_spec
-                    }
-                }
-            ]
-        }
-        self.service.spreadsheets().batchUpdate(
-            spreadsheetId=self.spreadsheet_id, body=body
-        ).execute()
+    print(f"📊 Extracted {len(parsed_deployments)} planned deployment(s) for today from active sheet.")
+    return parsed_deployments
 
 # ==============================================================================
-# STATUS PARITY LOGIC
+# 3. STATUS PARITY RESOLUTION
 # ==============================================================================
-def resolve_parity(sheet_data, jira_ticket):
-    s_status = (sheet_data.get("status") if sheet_data else "").strip().lower()
-    j_status = (jira_ticket.fields.status.name if jira_ticket else "").strip().lower()
+def resolve_effective_status(sheet_status, jira_status):
+    s_stat = (sheet_status or "").strip().lower()
+    j_stat = (jira_status or "").strip().lower()
 
-    if s_status in DONE_STATUSES or j_status in DONE_STATUSES:
+    # Sheet is source of truth for completion
+    if s_stat in DONE_STATUSES or j_stat in DONE_STATUSES:
         return "Done", "✅"
-    elif s_status in IN_PROGRESS_STATUSES or j_status in IN_PROGRESS_STATUSES:
+    elif s_stat in IN_PROGRESS_STATUSES or j_stat in IN_PROGRESS_STATUSES:
         return "In Progress", "⚙️"
-    elif "fail" in s_status or "fail" in j_status or "back" in s_status or "back" in j_status:
-        return "Failed/Backed Out", "🚧"
+    elif "fail" in s_stat or "fail" in j_stat:
+        return "Failed", "🚨"
+    elif any(w in s_stat or w in j_stat for w in ["back", "reschedule", "cancel"]):
+        return "Backed Out/Rescheduled", "🚧"
     else:
         return "Pending", "⏳"
 
 # ==============================================================================
-# VERTEX AI / GEMINI SERVICE
+# 4. VERTEX AI (GEMINI 2.5 FLASH) INTELLIGENT LIVE RADAR
 # ==============================================================================
-class GeminiService:
-    def __init__(self, project_id, location):
-        vertexai.init(project=project_id, location=location)
-        self.model = GenerativeModel("gemini-2.5-flash")
-        print("✅ Vertex AI (Gemini 2.5 Flash) initialized.")
+def analyze_with_gemini_2_5(enriched_deployments):
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
+    model = GenerativeModel("gemini-2.5-flash")
 
-    def analyze_unified_deployments(self, unified_list):
-        prompt = f"""
-        Analyze this raw deployment data from our Deployment Tracker (Jira + manual Sheet entries).
-        Data:
-        {json.dumps(unified_list, indent=2)}
+    prompt = f"""
+    You are the Senior TOC Deployment Lead at Osttra.
+    Analyze today's deployment schedule and current operational health.
+    
+    Data:
+    {json.dumps(enriched_deployments, indent=2)}
 
-        You are an intelligent Release Manager. Do the following:
-        1. Write a 1-sentence "executive_summary" summarizing today's overall deployment health.
-        2. For "comments", analyze description and recent comments for issues/blockers. If none, leave "".
-        3. Create a "short_desc" (MAX 3 to 5 words, strictly under 20 characters).
-        4. Deduce the "application" and "environment".
-        5. For "status", strictly use the provided "effective_status".
-        6. For "status_emoji", strictly use the provided "effective_emoji".
+    TASKS:
+    1. Write a 1-sentence "executive_summary" summarizing today's deployment progress (e.g. total completed, in progress, or any blockers).
+    2. For each deployment:
+       - Keep "change_no" exact.
+       - Create a concise "short_desc" (MAX 3 to 5 words, under 20 chars).
+       - Maintain the given "effective_status" and "effective_emoji".
+       - Determine clean "application" and "environment".
+    3. Generate "live_radar_items":
+       - ONLY for tasks that are NOT DONE (Pending, In Progress, Failed, Rescheduled) OR tasks that have important comments/blockers/dependencies.
+       - Analyze Jira comments and description to provide an intelligent 1-line update (e.g., "Deployment underway by Kamaldeep; awaiting QA signoff", "DB schema applied; app restart pending", "Blocked on CAB approval").
+       - If a task is completed smoothly with no issues, DO NOT include it in live radar.
 
-        OUTPUT STRICT VALID JSON ONLY (No markdown):
-        {{
-            "executive_summary": "...",
-            "deployments": [
-                {{
-                    "change_no": "...",
-                    "application": "...",
-                    "short_desc": "...",
-                    "environment": "...",
-                    "implementer": "...",
-                    "status": "...",
-                    "status_emoji": "...",
-                    "comments": "..."
-                }}
-            ]
-        }}
-        """
-        try:
-            resp = self.model.generate_content(prompt)
-            clean_json = resp.text.strip().replace("```json", "").replace("```", "")
-            return json.loads(clean_json)
-        except Exception as e:
-            print(f"❌ Failed to parse Gemini response: {e}")
-            return None
+    OUTPUT STRICT VALID JSON ONLY (No markdown):
+    {{
+        "executive_summary": "...",
+        "deployments": [
+            {{
+                "change_no": "...",
+                "application": "...",
+                "short_desc": "...",
+                "environment": "...",
+                "implementer": "...",
+                "status": "...",
+                "status_emoji": "..."
+            }}
+        ],
+        "live_radar": [
+            {{
+                "change_no": "...",
+                "app": "...",
+                "insight": "..."
+            }}
+        ]
+    }}
+    """
+
+    try:
+        resp = model.generate_content(
+            prompt,
+            generation_config=GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
+        )
+        return json.loads(resp.text.strip())
+    except Exception as e:
+        print(f"❌ Gemini analysis error: {e}", file=sys.stderr)
+        return None
 
 # ==============================================================================
-# GOOGLE CHAT NOTIFIER
+# 5. GOOGLE CHAT BROADCAST WITH HYPERLINKS
 # ==============================================================================
-def send_to_gchat(card_data):
+def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     if not card_data or not WEBHOOK_URL:
-        print("⚠️ Skipping Chat: No data or WEBHOOK_URL not configured.")
-        return
+        print("⚠️ Broadcast skipped: No data or WEBHOOK_URL not configured.")
+        return False
 
     summary = card_data.get("executive_summary", "")
     deployments = card_data.get("deployments", [])
+    radar_items = card_data.get("live_radar", [])
 
+    # Build ASCII Table
     headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
     rows = []
     for dep in deployments:
-        c_no = str(dep.get('change_no', 'N/A'))[:15]
+        c_no = str(dep.get('change_no', 'N/A'))[:13]
         app = str(dep.get('application', 'N/A'))[:8]
         desc = str(dep.get('short_desc', 'N/A'))[:20]
         env = str(dep.get('environment', 'N/A'))[:6]
         emoji = dep.get('status_emoji', '⏳')
-        owner = str(dep.get('implementer', 'N/A')).split(" ")[0][:10]
+        owner = str(dep.get('implementer', 'N/A')).split(' ')[0][:10]
         rows.append([c_no, app, desc, env, emoji, owner])
 
     col_widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            display_length = len(cell) - 1 if any(e in cell for e in ['✅','⚙️','⏳','🚧']) else len(cell)
-            col_widths[i] = max(col_widths[i], display_length)
+            disp_len = len(cell) - 1 if any(e in cell for e in ['✅','⚙️','⏳','🚨','🚧']) else len(cell)
+            col_widths[i] = max(col_widths[i], disp_len)
 
     header_line = "| " + " | ".join(h.ljust(w) for h, w in zip(headers, col_widths)) + " |"
     separator_line = "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"
     table_lines = [header_line, separator_line]
 
     for row in rows:
-        row_line = "|"
+        r_str = "|"
         for i, cell in enumerate(row):
             if i == 4:
-                row_line += f" " + (" " * (col_widths[i] - 1)) + f"{cell}|"
+                r_str += f" " + (" " * (col_widths[i] - 1)) + f"{cell}|"
             else:
-                row_line += f" {cell.ljust(col_widths[i])} |"
-        table_lines.append(row_line)
+                r_str += f" {cell.ljust(col_widths[i])} |"
+        table_lines.append(r_str)
 
     table_content = "\n".join(table_lines)
-
-    comments_section = ""
-    for dep in deployments:
-        key = dep.get('change_no', 'N/A')
-        emoji = dep.get('status_emoji', '')
-        c = dep.get("comments", "").strip()
-        is_done = emoji == "✅" or "done" in str(dep.get('status', '')).lower()
-        if not is_done and c and c.lower() not in ["none", "-", "n/a", "null", ""]:
-            comments_section += f"• **<{JIRA_SERVER}/browse/{key}|{key}>**: {c}\n"
-
     today_date = datetime.now(IST).strftime('%d/%m/%Y')
-    msg = f"*Hi All, Planned Changes for Today ({today_date}) (ReleaseRadar)*\n\n"
-    if summary:
-        msg += f"🤖 *AI Summary:* {summary}\n\n"
-    msg += f"```\n{table_content}\n```\n"
-    msg += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚧 Backed Out/Failed)*\n"
 
-    if comments_section:
-        msg += f"\n*⚡ Live Radar: Actionable Insights*\n{comments_section}"
+    # Header title
+    if is_wrap_up:
+        msg = f"*🎉 Wrap-up Update - Planned Changes for Today ({today_date}) (ReleaseRadar)*\n\n"
+    elif is_first_update:
+        msg = f"*Hi All, Planned Changes for Today ({today_date}) (ReleaseRadar)*\n\n"
+        if summary:
+            msg += f"🤖 *AI Summary:* {summary}\n\n"
+    else:
+        msg = f"*Hi All, Update - Planned Changes for Today ({today_date}) (ReleaseRadar)*\n\n"
+        if summary:
+            msg += f"🤖 *AI Summary:* {summary}\n\n"
+
+    msg += f"```\n{table_content}\n```\n"
+    msg += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚨 Failed | 🚧 Backed Out/Rescheduled)*\n"
+
+    # Clickable Live Radar Feed
+    if radar_items:
+        msg += "\n*⚡ Live Radar: Actionable Insights & Progress*\n"
+        for item in radar_items:
+            k = item.get("change_no")
+            app_str = f" ({item.get('app')})" if item.get('app') else ""
+            insight = item.get("insight")
+            msg += f"• *<{JIRA_SERVER}/browse/{k}|{k}>*{app_str}: {insight}\n"
 
     resp = requests.post(WEBHOOK_URL, headers={"Content-Type": "application/json"}, data=json.dumps({"text": msg}))
     if resp.status_code == 200:
-        print("✅ Google Chat update broadcasted successfully!")
+        print("✅ Live Radar table broadcasted to Google Chat successfully!")
+        return True
     else:
         print(f"❌ Chat post failed: {resp.status_code}, {resp.text}")
+        return False
 
 # ==============================================================================
-# MAIN SYNC CYCLE
+# 6. MAIN ENGINE
 # ==============================================================================
 def main():
-    print(f"\n--- Starting Integrated ReleaseRadar Bot ({datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}) ---")
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime('%Y-%m-%d')
+    print(f"\n=======================================================")
+    print(f"  RELEASERADAR LIVE FEED BOT | {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print(f"=======================================================")
 
-    jira = JiraService(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN)
-    sheets = GoogleSheetService(GOOGLE_SHEET_FILE_ID, GOOGLE_WORKSHEET_NAME)
-    gemini = GeminiService(GCP_PROJECT_ID, GCP_LOCATION)
+    # 1. Extract today's tickets from Sheet (Source of Truth)
+    sheet_tickets = get_today_deployments_from_sheet()
+    if not sheet_tickets:
+        print("No deployments found for today in the active sheet. Exiting.")
+        return
 
-    jira_tickets = jira.get_planned_changes()
+    # 2. Enrich with Jira deep context
+    jira_service = JiraContextService()
+    enriched = []
+    all_done = True
 
-    # 1. Parse existing sheet to preserve manual entries and formatting
-    all_values = sheets.get_all_values()
-    today_block_row, insertion_idx, existing_sheet_tickets = sheets.parse_sheet_for_today(all_values)
+    for t in sheet_tickets:
+        key = t["key"]
+        jira_ctx = jira_service.fetch_ticket_deep_context(key)
+        j_status = jira_ctx["jira_status"] if jira_ctx else ""
+        
+        eff_status, eff_emoji = resolve_effective_status(t["sheet_status"], j_status)
+        if eff_status != "Done":
+            all_done = False
 
-    new_tickets_to_add = []
-    jira_dict = {}
-    for t in jira_tickets:
-        jira_dict[t.key] = t
-        if t.key not in existing_sheet_tickets:
-            new_tickets_to_add.append(t)
-
-    print(f"[Sync] {len(existing_sheet_tickets)} tickets already in sheet (PERSISTED). {len(new_tickets_to_add)} new Jira ticket(s) to add.")
-
-    # 2. Add new tickets with HYPERLINK and EXTRACTED AFFECTED SERVICE
-    if new_tickets_to_add:
-        rows_to_add = []
-        for t in new_tickets_to_add:
-            summary = t.fields.summary
-            env = "PROD" if "prod" in summary.lower() else "UAT"
-            assignee = t.fields.assignee.displayName if t.fields.assignee else "Unassigned"
-
-            # 🔗 Clickable Jira Hyperlink Formula
-            jira_link_formula = f'=HYPERLINK("{JIRA_SERVER}/browse/{t.key}", "{t.key}")'
-
-            # 🎯 Extract Affected Service (e.g. "IC SA")
-            app_service = jira.extract_affected_service(t)
-
-            rows_to_add.append([
-                datetime.now(IST).strftime("%d/%m/%Y"), # Col A: Date
-                jira_link_formula,                      # Col B: CR (Clickable Link)
-                env,                                    # Col C: Env
-                "Upload",                               # Col D: Type
-                app_service,                            # Col E: Application (From Affected services)
-                summary,                                # Col F: Description
-                assignee,                               # Col G: Implementor
-                "10:00:00",                             # Col H: Start Time
-                t.fields.status.name                    # Col I: Status
-            ])
-
-        if today_block_row == -1:
-            print("Creating styled today block with hyperlinked tickets & clean headers...")
-            sheets.create_clean_today_block(rows_to_add, len(all_values))
-        else:
-            print(f"Inserting {len(rows_to_add)} new row(s) at line {insertion_idx}...")
-            sheets.insert_rows_at(rows_to_add, insertion_idx)
-    else:
-        print("✅ No new tickets to insert. All existing manual entries and statuses are untouched.")
-
-    # 3. Prepare Unified List for Gemini Analysis & Chat
-    unified_list = []
-    all_active_keys = set(existing_sheet_tickets.keys()) | set(jira_dict.keys())
-
-    for key in all_active_keys:
-        s_data = existing_sheet_tickets.get(key)
-        j_data = jira_dict.get(key)
-
-        effective_status, effective_emoji = resolve_parity(s_data, j_data)
-
-        desc = s_data.get("desc") if (s_data and s_data.get("desc")) else (j_data.fields.summary if j_data else key)
-        owner = s_data.get("owner") if (s_data and s_data.get("owner")) else (j_data.fields.assignee.displayName if j_data and j_data.fields.assignee else "TOC")
-        env = s_data.get("env") if (s_data and s_data.get("env")) else ("PROD" if "prod" in desc.lower() else "UAT")
-        app = s_data.get("app") if (s_data and s_data.get("app")) else (jira.extract_affected_service(j_data) if j_data else "")
-
-        comments = []
-        if j_data and hasattr(j_data.fields, 'comment') and j_data.fields.comment:
-            comments = [c.body for c in (j_data.fields.comment.comments or [])[-3:]]
-
-        unified_list.append({
-            "ticket_key": key,
-            "summary": desc,
-            "application": app,
-            "environment": env,
-            "assignee": owner,
-            "effective_status": effective_status,
-            "effective_emoji": effective_emoji,
-            "recent_comments": comments
+        enriched.append({
+            "key": key,
+            "sheet_app": t["app"],
+            "sheet_env": t["env"],
+            "sheet_type": t["type"],
+            "sheet_desc": t["desc"],
+            "sheet_owner": t["owner"],
+            "sheet_status": t["sheet_status"],
+            "effective_status": eff_status,
+            "effective_emoji": eff_emoji,
+            "jira_summary": jira_ctx["summary"] if jira_ctx else t["desc"],
+            "jira_comments": jira_ctx["comments"] if jira_ctx else [t.get("sheet_comments", "")],
+            "jira_description": jira_ctx["description"] if jira_ctx else ""
         })
 
-    # 4. Gemini Processing & Chat Broadcast
-    analysis = gemini.analyze_unified_deployments(unified_list)
-    if analysis:
-        send_to_gchat(analysis)
+    # 3. Handle First-run & Wrap-up State
+    for fname in [FIRST_RUN_FILE, STATE_FILE]:
+        if not os.path.exists(fname): open(fname, 'w').close()
+
+    is_first_run = True
+    with open(FIRST_RUN_FILE, "r") as f:
+        if f.read().strip() == today_str:
+            is_first_run = False
+
+    is_deadline = now_ist.hour >= 21
+    is_wrap_up = all_done or is_deadline
+
+    if is_wrap_up:
+        with open(STATE_FILE, "r") as f:
+            if f.read().strip() == today_str:
+                print("✅ Wrap-up update was already completed today. Exiting.")
+                return
+
+    # 4. Generate AI Summary & Live Radar
+    analysis = analyze_with_gemini_2_5(enriched)
+    if not analysis:
+        return
+
+    # 5. Send Broadcast
+    success = broadcast_to_gchat(analysis, is_first_update=is_first_run, is_wrap_up=is_wrap_up)
+
+    if success:
+        if is_first_run:
+            with open(FIRST_RUN_FILE, "w") as f: f.write(today_str)
+        if is_wrap_up:
+            with open(STATE_FILE, "w") as f: f.write(today_str)
+        else:
+            with open(STATE_FILE, "w") as f: f.write("")
 
 if __name__ == "__main__":
     main()
