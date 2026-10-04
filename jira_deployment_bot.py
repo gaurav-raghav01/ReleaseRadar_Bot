@@ -21,7 +21,7 @@ LOCATION = os.getenv("GCP_LOCATION", "us-central1")
 IST = timezone(timedelta(hours=5, minutes=30))
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-SHEET_FILE_ID = os.getenv("GOOGLE_SHEET_FILE_ID", "1NwJd8uzGIcDTxE0XJ_VYbqJfQnjuqxB4wh5UR97SIlk")
+SHEET_FILE_ID = os.getenv("GOOGLE_SHEET_FILE_ID", "1qITm4Ny1Kf_JZoKsrCLpbDHlbmET49OaqN1aNsI7JHo")
 
 JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
@@ -75,7 +75,7 @@ class JiraContextService:
 # 2. SHEET EXTRACTION ENGINE (SHEET IS SOURCE OF TRUTH)
 # ==============================================================================
 def extract_ticket_key(raw_cell):
-    """Extracts raw key like 'MSERV-660' from plain text or =HYPERLINK formulas."""
+    """Extracts raw key like 'TRMPLATFORM-10064' from plain text or =HYPERLINK formulas."""
     cell = str(raw_cell).strip()
     if '", "' in cell:
         return cell.split('", "')[-1].replace('")', '').strip()
@@ -101,7 +101,6 @@ def get_today_deployments_from_sheet():
     is_weekend = now_ist.weekday() >= 5
     target_file_id = SHEET_FILE_ID
 
-    # Weekend Sheet dynamic lookup
     if is_weekend:
         if now_ist.weekday() == 5:
             sat_date = now_ist
@@ -123,7 +122,6 @@ def get_today_deployments_from_sheet():
     else:
         print(f"📅 Daily operations active. Reading daily changes sheet...")
 
-    # Export sheet as CSV
     try:
         resp = drive_service.files().export_media(fileId=target_file_id, mimeType='text/csv').execute()
         reader = csv.reader(StringIO(resp.decode('utf-8')))
@@ -138,7 +136,7 @@ def get_today_deployments_from_sheet():
     parsed_deployments = []
 
     if is_weekend:
-        today_day_name = now_ist.strftime("%A") # "Saturday" or "Sunday"
+        today_day_name = now_ist.strftime("%A")
         current_block = None
 
         for row in values:
@@ -150,7 +148,6 @@ def get_today_deployments_from_sheet():
                 current_block = clean[0]
                 continue
 
-            # In weekend sheet: Row format is [Change, Env, Type, Description, Impacted App, Implementor, Validator, Impl Status, Validation Status, TOC Owner...]
             if current_block == today_day_name and len(row) > 7:
                 k = extract_ticket_key(row[0])
                 if k and k not in ["Change", "CR", "Saturday", "Sunday"]:
@@ -165,7 +162,6 @@ def get_today_deployments_from_sheet():
                         "sheet_comments": row[11].strip() if len(row) > 11 else ""
                     })
     else:
-        # Daily sheet matching today's date
         possible_dates = [
             now_ist.strftime("%d/%m/%Y"), now_ist.strftime("%d/%m/%y"),
             now_ist.strftime("%Y-%m-%d"), f"{now_ist.day}/{now_ist.month}/{now_ist.year}"
@@ -181,7 +177,6 @@ def get_today_deployments_from_sheet():
             elif today_active and ('/' in c0 or '-' in c0) and not any(d in c0 for d in possible_dates):
                 break
 
-            # Daily format: [Date, CR, Env, Type, Application, Description, Implementor, Start Time, Status]
             if today_active and len(row) > 1 and row[1]:
                 k = extract_ticket_key(row[1])
                 if k and k not in ["CR", "Change"]:
@@ -206,7 +201,6 @@ def resolve_effective_status(sheet_status, jira_status):
     s_stat = (sheet_status or "").strip().lower()
     j_stat = (jira_status or "").strip().lower()
 
-    # Sheet is source of truth for completion
     if s_stat in DONE_STATUSES or j_stat in DONE_STATUSES:
         return "Done", "✅"
     elif s_stat in IN_PROGRESS_STATUSES or j_stat in IN_PROGRESS_STATUSES:
@@ -233,16 +227,16 @@ def analyze_with_gemini_2_5(enriched_deployments):
     {json.dumps(enriched_deployments, indent=2)}
 
     TASKS:
-    1. Write a 1-sentence "executive_summary" summarizing today's deployment progress (e.g. total completed, in progress, or any blockers).
+    1. Write a 1-sentence "executive_summary" summarizing today's deployment progress.
     2. For each deployment:
        - Keep "change_no" exact.
-       - Create a concise "short_desc" (MAX 3 to 5 words, under 20 chars).
+       - Create a concise "short_desc" (MAX 3 to 5 words, strictly under 20 chars).
        - Maintain the given "effective_status" and "effective_emoji".
        - Determine clean "application" and "environment".
     3. Generate "live_radar_items":
-       - ONLY for tasks that are NOT DONE (Pending, In Progress, Failed, Rescheduled) OR tasks that have important comments/blockers/dependencies.
-       - Analyze Jira comments and description to provide an intelligent 1-line update (e.g., "Deployment underway by Kamaldeep; awaiting QA signoff", "DB schema applied; app restart pending", "Blocked on CAB approval").
-       - If a task is completed smoothly with no issues, DO NOT include it in live radar.
+       - Include tasks that are NOT DONE (Pending, In Progress, Failed, Rescheduled).
+       - MANDATORY: If a deployment has a long ticket key (e.g. TRMPLATFORM-XXXXX or LIMITHUB-XXXXX), ALWAYS include it in live_radar with its full summary so the team has full clarity.
+       - Analyze Jira comments and description to provide an intelligent 1-line update.
 
     OUTPUT STRICT VALID JSON ONLY (No markdown):
     {{
@@ -282,7 +276,7 @@ def analyze_with_gemini_2_5(enriched_deployments):
         return None
 
 # ==============================================================================
-# 5. GOOGLE CHAT BROADCAST WITH HYPERLINKS
+# 5. GOOGLE CHAT BROADCAST WITH HYPERLINKS & CLEAN LEGEND
 # ==============================================================================
 def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     if not card_data or not WEBHOOK_URL:
@@ -293,11 +287,26 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     deployments = card_data.get("deployments", [])
     radar_items = card_data.get("live_radar", [])
 
-    # Build ASCII Table
+    # Guarantee any long keys (> 14 chars) are present in the Live Radar block
+    radar_keys = {item.get("change_no") for item in radar_items}
+    for dep in deployments:
+        c_key = dep.get("change_no", "")
+        if len(c_key) > 13 and c_key not in radar_keys:
+            app_name = dep.get("application", "")
+            desc_text = dep.get("short_desc", "Deployment task")
+            status_text = dep.get("status", "Active")
+            radar_items.append({
+                "change_no": c_key,
+                "app": app_name,
+                "insight": f"Status: {status_text} - {desc_text}"
+            })
+            radar_keys.add(c_key)
+
+    # Build ASCII Table (allowing up to 17 characters for Change No)
     headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
     rows = []
     for dep in deployments:
-        c_no = str(dep.get('change_no', 'N/A'))[:13]
+        c_no = str(dep.get('change_no', 'N/A'))[:17]  # Extended to fit full TRMPLATFORM-XXXXX
         app = str(dep.get('application', 'N/A'))[:8]
         desc = str(dep.get('short_desc', 'N/A'))[:20]
         env = str(dep.get('environment', 'N/A'))[:6]
@@ -340,7 +349,8 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
             msg += f"🤖 *AI Summary:* {summary}\n\n"
 
     msg += f"```\n{table_content}\n```\n"
-    msg += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚨 Failed | 🚧 Backed Out/Rescheduled)*\n"
+    # Cleaned legend removing 'Backed Out/'
+    msg += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚨 Failed | 🚧 Rescheduled)*\n"
 
     # Clickable Live Radar Feed
     if radar_items:
