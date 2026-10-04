@@ -214,7 +214,7 @@ def resolve_effective_status(sheet_status, jira_status):
     elif "fail" in s_stat or "fail" in j_stat:
         return "Failed", "🚨"
     elif any(w in s_stat or w in j_stat for w in ["back", "reschedule", "cancel"]):
-        return "Backed Out/Rescheduled", "🚧"
+        return "Rescheduled", "🚧"
     else:
         return "Pending", "⏳"
 
