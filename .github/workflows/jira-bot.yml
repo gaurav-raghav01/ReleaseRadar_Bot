@@ -1,4 +1,4 @@
-name: Deployment Updates Bot
+name: ReleaseRadar Bot
 
 on:
   workflow_dispatch: {}
