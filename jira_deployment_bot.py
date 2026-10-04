@@ -57,7 +57,7 @@ class JiraContextService:
                 for c in (issue.fields.comment.comments or [])[-4:]:
                     author = getattr(c.author, 'displayName', 'Team')
                     body_clean = re.sub(r'[\r\n]+', ' ', c.body).strip()
-                    comments.append(f"[{author}]: {body_clean[:200]}")
+                    comments.append(f"[{author}]: {body_clean[:220]}")
 
             return {
                 "key": issue.key,
@@ -213,7 +213,7 @@ def resolve_effective_status(sheet_status, jira_status):
         return "Pending", "⏳"
 
 # ==============================================================================
-# 4. VERTEX AI (GEMINI 2.5 FLASH) INTELLIGENT LIVE RADAR
+# 4. VERTEX AI (GEMINI 2.5 FLASH) INTELLIGENT AUTO-RADAR
 # ==============================================================================
 def analyze_with_gemini_2_5(enriched_deployments):
     vertexai.init(project=PROJECT_ID, location=LOCATION)
@@ -233,10 +233,14 @@ def analyze_with_gemini_2_5(enriched_deployments):
        - Create a concise "short_desc" (MAX 3 to 5 words, strictly under 20 chars).
        - Maintain the given "effective_status" and "effective_emoji".
        - Determine clean "application" and "environment".
-    3. Generate "live_radar_items":
-       - Include tasks that are NOT DONE (Pending, In Progress, Failed, Rescheduled).
-       - MANDATORY: If a deployment has a long ticket key (e.g. TRMPLATFORM-XXXXX or LIMITHUB-XXXXX), ALWAYS include it in live_radar with its full summary so the team has full clarity.
-       - Analyze Jira comments and description to provide an intelligent 1-line update.
+    
+    3. Generate "live_radar_items" (STRICT AUTO MODE):
+       - Act as an intelligent engineer analyzing the deployment's status, description, and recent comments.
+       - ONLY include tickets that warrant real attention or have meaningful operational context:
+         * Tasks currently In Progress, Pending, Failed, or Rescheduled.
+         * Tasks with noteworthy blockers, technical nuances, or client handoffs discussed in the comments (e.g. SIFMA DR reschedule, FpML mapping issue, client testing acknowledgement).
+       - DO NOT include tickets that completed routinely without any issues or special notes.
+       - For selected tickets, provide a sharp, professional 1-sentence summary of the latest progress or status.
 
     OUTPUT STRICT VALID JSON ONLY (No markdown):
     {{
@@ -287,21 +291,6 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     deployments = card_data.get("deployments", [])
     radar_items = card_data.get("live_radar", [])
 
-    # Guarantee any long keys (> 14 chars) are present in the Live Radar block
-    radar_keys = {item.get("change_no") for item in radar_items}
-    for dep in deployments:
-        c_key = dep.get("change_no", "")
-        if len(c_key) > 13 and c_key not in radar_keys:
-            app_name = dep.get("application", "")
-            desc_text = dep.get("short_desc", "Deployment task")
-            status_text = dep.get("status", "Active")
-            radar_items.append({
-                "change_no": c_key,
-                "app": app_name,
-                "insight": f"Status: {status_text} - {desc_text}"
-            })
-            radar_keys.add(c_key)
-
     # Build ASCII Table (allowing up to 17 characters for Change No)
     headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
     rows = []
@@ -349,10 +338,9 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
             msg += f"🤖 *AI Summary:* {summary}\n\n"
 
     msg += f"```\n{table_content}\n```\n"
-    # Cleaned legend removing 'Backed Out/'
     msg += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚨 Failed | 🚧 Rescheduled)*\n"
 
-    # Clickable Live Radar Feed
+    # Clickable Live Radar Feed (Auto Mode)
     if radar_items:
         msg += "\n*⚡ Live Radar: Actionable Insights & Progress*\n"
         for item in radar_items:
