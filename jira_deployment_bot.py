@@ -33,6 +33,9 @@ FIRST_RUN_FILE = "first_run_state.txt" # Tracks first morning broadcast
 DONE_STATUSES = {"done", "completed", "closed", "resolved", "implemented", "success"}
 IN_PROGRESS_STATUSES = {"in progress", "work in progress", "implementing", "started", "review"}
 
+# Regex pattern to match any Jira key (e.g., MSERV-629, INTU-314, TRMPLATFORM-10064)
+JIRA_KEY_REGEX = re.compile(r'\b([A-Z]{2,12}-\d+)\b')
+
 # ==============================================================================
 # 1. JIRA DEEP CONTEXT SERVICE
 # ==============================================================================
@@ -47,7 +50,6 @@ class JiraContextService:
                 print(f"⚠️ Jira connection warning: {e}. Falling back to sheet-only context.")
 
     def fetch_ticket_deep_context(self, ticket_key):
-        """Fetches raw ticket data, summary, status, and the latest comments."""
         if not self.client:
             return None
         try:
@@ -72,19 +74,19 @@ class JiraContextService:
             return None
 
 # ==============================================================================
-# 2. SHEET EXTRACTION ENGINE (SHEET IS SOURCE OF TRUTH)
+# 2. ROBUST COLUMN-AGNOSTIC SHEET EXTRACTION
 # ==============================================================================
-def extract_ticket_key(raw_cell):
-    """Extracts raw key like 'TRMPLATFORM-10064' from plain text or =HYPERLINK formulas."""
-    cell = str(raw_cell).strip()
-    if '", "' in cell:
-        return cell.split('", "')[-1].replace('")', '').strip()
-    elif '",' in cell:
-        return cell.split('",')[-1].replace(')', '').replace('"', '').strip()
-    return cell
+def find_jira_key_in_row(row):
+    """Finds the first Jira ticket key anywhere in the row."""
+    for cell in row:
+        c_str = str(cell).strip()
+        m = JIRA_KEY_REGEX.search(c_str)
+        if m:
+            return m.group(1)
+    return None
 
 def get_today_deployments_from_sheet():
-    print("🔍 Authenticating via ADC and querying active deployment sheet...")
+    print("🔍 Querying active deployment sheet...")
     scopes = [
         'https://www.googleapis.com/auth/drive.readonly',
         'https://www.googleapis.com/auth/cloud-platform'
@@ -94,7 +96,7 @@ def get_today_deployments_from_sheet():
     try:
         drive_service = build('drive', 'v3', credentials=credentials)
     except Exception as e:
-        print(f"❌ CRITICAL ERROR: Failed to connect to Drive API: {e}", file=sys.stderr)
+        print(f"❌ CRITICAL ERROR: Drive API connect failed: {e}", file=sys.stderr)
         sys.exit(1)
 
     now_ist = datetime.now(IST)
@@ -102,15 +104,10 @@ def get_today_deployments_from_sheet():
     target_file_id = SHEET_FILE_ID
 
     if is_weekend:
-        if now_ist.weekday() == 5:
-            sat_date = now_ist
-            sun_date = now_ist + timedelta(days=1)
-        else:
-            sat_date = now_ist - timedelta(days=1)
-            sun_date = now_ist
-
+        sat_date = now_ist if now_ist.weekday() == 5 else now_ist - timedelta(days=1)
+        sun_date = sat_date + timedelta(days=1)
         weekend_filename = f"{sat_date.strftime('%d-%m-%Y')} & {sun_date.strftime('%d-%m-%Y')}"
-        print(f"🗓️ Weekend active! Resolving sheet: '{weekend_filename}'")
+        print(f"🗓️ Searching Drive for weekend tracker: '{weekend_filename}'")
         q = f"name contains '{weekend_filename}' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false"
         res = drive_service.files().list(q=q, fields="files(id, name)").execute()
         files = res.get('files', [])
@@ -120,7 +117,7 @@ def get_today_deployments_from_sheet():
         target_file_id = files[0]['id']
         print(f"✅ Found weekend tracker: {files[0]['name']}")
     else:
-        print(f"📅 Daily operations active. Reading daily changes sheet...")
+        print(f"📅 Reading daily changes sheet ({target_file_id})...")
 
     try:
         resp = drive_service.files().export_media(fileId=target_file_id, mimeType='text/csv').execute()
@@ -136,7 +133,7 @@ def get_today_deployments_from_sheet():
     parsed_deployments = []
 
     if is_weekend:
-        today_day_name = now_ist.strftime("%A")
+        today_day_name = now_ist.strftime("%A") # "Saturday" or "Sunday"
         current_block = None
 
         for row in values:
@@ -144,50 +141,64 @@ def get_today_deployments_from_sheet():
             clean = [str(c).strip() for c in row if str(c).strip()]
             if not clean: continue
 
-            if clean[0] in ["Saturday", "Sunday"]:
-                current_block = clean[0]
+            if any(day in clean[0] for day in ["Saturday", "Sunday"]):
+                current_block = "Saturday" if "Saturday" in clean[0] else "Sunday"
                 continue
 
-            if current_block == today_day_name and len(row) > 7:
-                k = extract_ticket_key(row[0])
-                if k and k not in ["Change", "CR", "Saturday", "Sunday"]:
+            if current_block == today_day_name:
+                key = find_jira_key_in_row(row)
+                if key and key not in ["CR", "Change"]:
+                    # Find column index of key to extract relative columns
+                    k_idx = 0
+                    for idx, c in enumerate(row):
+                        if key in str(c):
+                            k_idx = idx
+                            break
                     parsed_deployments.append({
-                        "key": k,
-                        "env": row[1].strip() if len(row) > 1 else "PROD",
-                        "type": row[2].strip() if len(row) > 2 else "Normal",
-                        "desc": row[3].strip() if len(row) > 3 else "",
-                        "app": row[4].strip() if len(row) > 4 else "",
-                        "owner": row[9].strip() if len(row) > 9 and row[9] else (row[5].strip() if len(row) > 5 else "TOC"),
-                        "sheet_status": row[7].strip() if len(row) > 7 else "Pending",
-                        "sheet_comments": row[11].strip() if len(row) > 11 else ""
+                        "key": key,
+                        "env": row[k_idx + 1].strip() if len(row) > k_idx + 1 else "PROD",
+                        "type": row[k_idx + 2].strip() if len(row) > k_idx + 2 else "Normal",
+                        "desc": row[k_idx + 3].strip() if len(row) > k_idx + 3 else "",
+                        "app": row[k_idx + 4].strip() if len(row) > k_idx + 4 else "",
+                        "owner": row[k_idx + 9].strip() if len(row) > k_idx + 9 and row[k_idx + 9] else (row[k_idx + 5].strip() if len(row) > k_idx + 5 else "TOC"),
+                        "sheet_status": row[k_idx + 7].strip() if len(row) > k_idx + 7 else "Pending",
+                        "sheet_comments": row[k_idx + 11].strip() if len(row) > k_idx + 11 else ""
                     })
     else:
+        # Match today's date formats across ANY column
         possible_dates = [
-            now_ist.strftime("%d/%m/%Y"), now_ist.strftime("%d/%m/%y"),
-            now_ist.strftime("%Y-%m-%d"), f"{now_ist.day}/{now_ist.month}/{now_ist.year}"
+            now_ist.strftime("%d/%m/%Y"),
+            now_ist.strftime("%d/%m/%y"),
+            now_ist.strftime("%Y-%m-%d"),
+            f"{now_ist.day:02d}/{now_ist.month:02d}/{now_ist.year}",
+            f"{now_ist.day}/{now_ist.month}/{now_ist.year}"
         ]
-        today_active = False
 
         for row in values:
             if not row or not any(row): continue
-            c0 = str(row[0]).strip()
-            if any(d in c0 for d in possible_dates):
-                today_active = True
-                continue
-            elif today_active and ('/' in c0 or '-' in c0) and not any(d in c0 for d in possible_dates):
-                break
-
-            if today_active and len(row) > 1 and row[1]:
-                k = extract_ticket_key(row[1])
-                if k and k not in ["CR", "Change"]:
+            
+            # Check if this row belongs to today by scanning ALL cells
+            has_today_date = any(any(d == str(cell).strip() or d in str(cell).strip() for d in possible_dates) for cell in row)
+            
+            if has_today_date:
+                key = find_jira_key_in_row(row)
+                if key and key not in ["CR", "Change", "Date"]:
+                    # Find key index in row to get relative attributes
+                    k_idx = 0
+                    for idx, c in enumerate(row):
+                        if key in str(c):
+                            k_idx = idx
+                            break
+                    
+                    # Row layout: [Date, Key, Env, Type, App, Desc, Owner, Time, Status]
                     parsed_deployments.append({
-                        "key": k,
-                        "env": row[2].strip() if len(row) > 2 else "PROD",
-                        "type": row[3].strip() if len(row) > 3 else "Normal",
-                        "app": row[4].strip() if len(row) > 4 else "",
-                        "desc": row[5].strip() if len(row) > 5 else "",
-                        "owner": row[6].strip() if len(row) > 6 else "TOC",
-                        "sheet_status": row[8].strip() if len(row) > 8 else "Pending",
+                        "key": key,
+                        "env": row[k_idx + 1].strip() if len(row) > k_idx + 1 else "PROD",
+                        "type": row[k_idx + 2].strip() if len(row) > k_idx + 2 else "Normal",
+                        "app": row[k_idx + 3].strip() if len(row) > k_idx + 3 else (row[k_idx + 4].strip() if len(row) > k_idx + 4 else ""),
+                        "desc": row[k_idx + 4].strip() if len(row) > k_idx + 4 else (row[k_idx + 5].strip() if len(row) > k_idx + 5 else ""),
+                        "owner": row[k_idx + 5].strip() if len(row) > k_idx + 5 else (row[k_idx + 6].strip() if len(row) > k_idx + 6 else "TOC"),
+                        "sheet_status": row[-1].strip() if row[-1].strip() else (row[k_idx + 7].strip() if len(row) > k_idx + 7 else "Pending"),
                         "sheet_comments": ""
                     })
 
@@ -238,7 +249,7 @@ def analyze_with_gemini_2_5(enriched_deployments):
        - Act as an intelligent engineer analyzing the deployment's status, description, and recent comments.
        - ONLY include tickets that warrant real attention or have meaningful operational context:
          * Tasks currently In Progress, Pending, Failed, or Rescheduled.
-         * Tasks with noteworthy blockers, technical nuances, or client handoffs discussed in the comments (e.g. SIFMA DR reschedule, FpML mapping issue, client testing acknowledgement).
+         * Tasks with noteworthy blockers, technical nuances, or client handoffs discussed in the comments.
        - DO NOT include tickets that completed routinely without any issues or special notes.
        - For selected tickets, provide a sharp, professional 1-sentence summary of the latest progress or status.
 
@@ -295,7 +306,7 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
     rows = []
     for dep in deployments:
-        c_no = str(dep.get('change_no', 'N/A'))[:17]  # Extended to fit full TRMPLATFORM-XXXXX
+        c_no = str(dep.get('change_no', 'N/A'))[:17]
         app = str(dep.get('application', 'N/A'))[:8]
         desc = str(dep.get('short_desc', 'N/A'))[:20]
         env = str(dep.get('environment', 'N/A'))[:6]
@@ -325,7 +336,6 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     table_content = "\n".join(table_lines)
     today_date = datetime.now(IST).strftime('%d/%m/%Y')
 
-    # Header title
     if is_wrap_up:
         msg = f"*🎉 Wrap-up Update - Planned Changes for Today ({today_date}) (ReleaseRadar)*\n\n"
     elif is_first_update:
@@ -367,7 +377,7 @@ def main():
     print(f"  RELEASERADAR LIVE FEED BOT | {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
     print(f"=======================================================")
 
-    # 1. Extract today's tickets from Sheet (Source of Truth)
+    # 1. Extract today's tickets from Sheet (Column-agnostic matching)
     sheet_tickets = get_today_deployments_from_sheet()
     if not sheet_tickets:
         print("No deployments found for today in the active sheet. Exiting.")
