@@ -1,13 +1,13 @@
 name: Deployment Updates Bot
 
-on:    
-  workflow_dispatch: {} 
+on:
+  workflow_dispatch: {}
 
 jobs:
   deployment-tracker:
     runs-on: ubuntu-latest
     permissions:
-      contents: write 
+      contents: write
 
     steps:
       - name: Checkout Code
@@ -21,7 +21,8 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install google-auth google-api-python-client vertexai requests
+          pip uninstall -y jira-python
+          pip install google-auth google-api-python-client vertexai requests jira
 
       - name: Inject GCP Credentials
         env:
@@ -31,12 +32,14 @@ jobs:
 
       - name: Run Deployment Bot
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json 
+          GOOGLE_APPLICATION_CREDENTIALS: gcp_keys.json
           WEBHOOK_URL: ${{ secrets.PROD_GC_WEBHOOK_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: python deployment_bot.py
 
       - name: Save Bot State Files (Auto-Commit)
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: update bot execution states"
+          commit_message: "chore: update bot execution states [skip ci]"
           file_pattern: "*.txt"
