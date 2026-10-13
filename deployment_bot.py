@@ -5,36 +5,36 @@ import csv
 import re
 from io import StringIO
 from datetime import datetime, timedelta, timezone
-
+  
 import google.auth
 from googleapiclient.discovery import build
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 import requests
 from jira import JIRA
-
+  
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "prj-s-ai-bot-4rl8")
 LOCATION = os.getenv("GCP_LOCATION", "us-central1")
 IST = timezone(timedelta(hours=5, minutes=30))
-
+  
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 SHEET_FILE_ID = os.getenv("GOOGLE_SHEET_FILE_ID", "1qITm4Ny1Kf_JZoKsrCLpbDHlbmET49OaqN1aNsI7JHo")
-
+  
 JIRA_SERVER = os.getenv("JIRA_SERVER", "https://osttra.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
-
+  
 STATE_FILE = "last_run_state.txt"       # Tracks if wrap-up was sent
 FIRST_RUN_FILE = "first_run_state.txt" # Tracks first morning broadcast
-
+  
 DONE_STATUSES = {"done", "completed", "closed", "resolved", "implemented", "success"}
 IN_PROGRESS_STATUSES = {"in progress", "work in progress", "implementing", "started", "review"}
-
+  
 JIRA_KEY_REGEX = re.compile(r'\b([A-Z]{2,12}-\d+)\b')
-
+  
 # ==============================================================================
 # 1. JIRA DEEP CONTEXT SERVICE
 # ==============================================================================
@@ -47,7 +47,7 @@ class JiraContextService:
                 print("✅ Connected to Jira REST API for deep context extraction.")
             except Exception as e:
                 print(f"⚠️ Jira connection warning: {e}. Falling back to sheet-only context.")
-
+  
     def fetch_ticket_deep_context(self, ticket_key):
         if not self.client:
             return None
@@ -59,7 +59,7 @@ class JiraContextService:
                     author = getattr(c.author, 'displayName', 'Team')
                     body_clean = re.sub(r'[\r\n]+', ' ', c.body).strip()
                     comments.append(f"[{author}]: {body_clean[:220]}")
-
+  
             return {
                 "key": issue.key,
                 "summary": issue.fields.summary,
@@ -71,7 +71,7 @@ class JiraContextService:
         except Exception as e:
             print(f"⚠️ Could not fetch Jira context for {ticket_key}: {e}")
             return None
-
+  
 # ==============================================================================
 # 2. COLUMN-AGNOSTIC SHEET EXTRACTION (SHEET IS SOURCE OF TRUTH)
 # ==============================================================================
@@ -82,7 +82,7 @@ def find_jira_key_in_row(row):
         if m:
             return m.group(1)
     return None
-
+  
 def get_today_deployments_from_sheet():
     print("🔍 Querying active deployment sheet...")
     scopes = [
@@ -90,17 +90,17 @@ def get_today_deployments_from_sheet():
         'https://www.googleapis.com/auth/cloud-platform'
     ]
     credentials, _ = google.auth.default(scopes=scopes)
-
+  
     try:
         drive_service = build('drive', 'v3', credentials=credentials)
     except Exception as e:
         print(f"❌ CRITICAL ERROR: Drive API connect failed: {e}", file=sys.stderr)
         sys.exit(1)
-
+  
     now_ist = datetime.now(IST)
     is_weekend = now_ist.weekday() >= 5
     target_file_id = SHEET_FILE_ID
-
+  
     if is_weekend:
         sat_date = now_ist if now_ist.weekday() == 5 else now_ist - timedelta(days=1)
         sun_date = sat_date + timedelta(days=1)
@@ -116,7 +116,7 @@ def get_today_deployments_from_sheet():
         print(f"✅ Found weekend tracker: {files[0]['name']}")
     else:
         print(f"📅 Reading daily changes sheet ({target_file_id})...")
-
+  
     try:
         resp = drive_service.files().export_media(fileId=target_file_id, mimeType='text/csv').execute()
         reader = csv.reader(StringIO(resp.decode('utf-8')))
@@ -124,25 +124,25 @@ def get_today_deployments_from_sheet():
     except Exception as e:
         print(f"❌ Failed to download sheet CSV: {e}", file=sys.stderr)
         return []
-
+  
     if not values:
         return []
-
+  
     parsed_deployments = []
-
+  
     if is_weekend:
         today_day_name = now_ist.strftime("%A")
         current_block = None
-
+  
         for row in values:
             if not row or not any(row): continue
             clean = [str(c).strip() for c in row if str(c).strip()]
             if not clean: continue
-
+  
             if any(day in clean[0] for day in ["Saturday", "Sunday"]):
                 current_block = "Saturday" if "Saturday" in clean[0] else "Sunday"
                 continue
-
+  
             if current_block == today_day_name:
                 key = find_jira_key_in_row(row)
                 if key and key not in ["Change", "CR", "Saturday", "Sunday"]:
@@ -169,7 +169,7 @@ def get_today_deployments_from_sheet():
             f"{now_ist.day:02d}/{now_ist.month:02d}/{now_ist.year}",
             f"{now_ist.day}/{now_ist.month}/{now_ist.year}"
         ]
-
+  
         for row in values:
             if not row or not any(row): continue
             
@@ -194,17 +194,17 @@ def get_today_deployments_from_sheet():
                         "sheet_status": row[-1].strip() if row[-1].strip() else (row[k_idx + 7].strip() if len(row) > k_idx + 7 else "Pending"),
                         "sheet_comments": ""
                     })
-
+  
     print(f"📊 Extracted {len(parsed_deployments)} planned deployment(s) for today from active sheet.")
     return parsed_deployments
-
+  
 # ==============================================================================
 # 3. STATUS PARITY RESOLUTION
 # ==============================================================================
 def resolve_effective_status(sheet_status, jira_status):
     s_stat = (sheet_status or "").strip().lower()
     j_stat = (jira_status or "").strip().lower()
-
+  
     if s_stat in DONE_STATUSES or j_stat in DONE_STATUSES:
         return "Done", "✅"
     elif s_stat in IN_PROGRESS_STATUSES or j_stat in IN_PROGRESS_STATUSES:
@@ -215,37 +215,37 @@ def resolve_effective_status(sheet_status, jira_status):
         return "Rescheduled", "🚧"
     else:
         return "Pending", "⏳"
-
+  
 # ==============================================================================
 # 4. VERTEX AI (GEMINI 2.5 FLASH) INTELLIGENT AUTO-RADAR
 # ==============================================================================
 def analyze_with_gemini_2_5(enriched_deployments):
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     model = GenerativeModel("gemini-2.5-flash")
-
+  
     prompt = f"""
     You are the Senior TOC Deployment Lead at Osttra.
     Analyze today's deployment schedule and current operational health.
     
     Data:
     {json.dumps(enriched_deployments, indent=2)}
-
+  
     TASKS:
-    1. Write a 1-sentence "executive_summary" summarizing today's deployment progress.
-    2. For each deployment:
+    1\. Write a 1-sentence "executive_summary" summarizing today's deployment progress.
+    2\. For each deployment:
        - Keep "change_no" exact.
        - Create a concise "short_desc" (MAX 3 to 5 words, strictly under 20 chars).
        - Maintain the given "effective_status" and "effective_emoji".
        - Determine clean "application" and "environment".
     
-    3. Generate "live_radar_items" (STRICT AUTO MODE):
+    3\. Generate "live_radar_items" (STRICT AUTO MODE):
        - Act as an intelligent engineer analyzing the deployment's status, description, and recent comments.
        - ONLY include tickets that warrant real attention or have meaningful operational context:
-         * Tasks currently In Progress, Pending, Failed, or Rescheduled.
-         * Tasks with noteworthy blockers, technical nuances, or client handoffs discussed in the comments.
+         \* Tasks currently In Progress, Pending, Failed, or Rescheduled.
+         \* Tasks with noteworthy blockers, technical nuances, or client handoffs discussed in the comments.
        - DO NOT include tickets that completed routinely without any issues or special notes.
        - For selected tickets, provide a sharp, professional 1-sentence summary of the latest progress or status.
-
+  
     OUTPUT STRICT VALID JSON ONLY (No markdown):
     {{
         "executive_summary": "...",
@@ -269,7 +269,7 @@ def analyze_with_gemini_2_5(enriched_deployments):
         ]
     }}
     """
-
+  
     try:
         resp = model.generate_content(
             prompt,
@@ -282,7 +282,7 @@ def analyze_with_gemini_2_5(enriched_deployments):
     except Exception as e:
         print(f"❌ Gemini analysis error: {e}", file=sys.stderr)
         return None
-
+  
 # ==============================================================================
 # 5. GOOGLE CHAT BROADCAST WITH HYPERLINKS & CLEAN LEGEND
 # ==============================================================================
@@ -290,11 +290,11 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     if not card_data or not WEBHOOK_URL:
         print("⚠️ Broadcast skipped: No data or WEBHOOK_URL not configured.")
         return False
-
+  
     summary = card_data.get("executive_summary", "")
     deployments = card_data.get("deployments", [])
     radar_items = card_data.get("live_radar", [])
-
+  
     # Build ASCII Table (allowing up to 17 characters for Change No)
     headers = ["Change No", "App", "Desc", "Env", "St's", "Owner"]
     rows = []
@@ -306,17 +306,17 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
         emoji = dep.get('status_emoji', '⏳')
         owner = str(dep.get('implementer', 'N/A')).split(' ')[0][:10]
         rows.append([c_no, app, desc, env, emoji, owner])
-
+  
     col_widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
             disp_len = len(cell) - 1 if any(e in cell for e in ['✅','⚙️','⏳','🚨','🚧']) else len(cell)
             col_widths[i] = max(col_widths[i], disp_len)
-
+  
     header_line = "| " + " | ".join(h.ljust(w) for h, w in zip(headers, col_widths)) + " |"
     separator_line = "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"
     table_lines = [header_line, separator_line]
-
+  
     for row in rows:
         r_str = "|"
         for i, cell in enumerate(row):
@@ -325,10 +325,10 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
             else:
                 r_str += f" {cell.ljust(col_widths[i])} |"
         table_lines.append(r_str)
-
+  
     table_content = "\n".join(table_lines)
     today_date = datetime.now(IST).strftime('%d/%m/%Y')
-
+  
     if is_wrap_up:
         msg = f"*🎉 Wrap-up Update - Planned Changes for Today ({today_date}) (ReleaseRadar)*\n\n"
     elif is_first_update:
@@ -339,10 +339,10 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
         msg = f"*Hi All, Update - Planned Changes for Today ({today_date}) (ReleaseRadar)*\n\n"
         if summary:
             msg += f"🤖 *AI Summary:* {summary}\n\n"
-
+  
     msg += f"```\n{table_content}\n```\n"
     msg += "*(Legend: ✅ Done | ⚙️ In Progress | ⏳ Pending | 🚨 Failed | 🚧 Rescheduled)*\n"
-
+  
     # Clickable Live Radar Feed (Auto Mode)
     if radar_items:
         msg += "\n*⚡ Live Radar: Actionable Insights & Progress*\n"
@@ -351,7 +351,7 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
             app_str = f" ({item.get('app')})" if item.get('app') else ""
             insight = item.get("insight")
             msg += f"• *<{JIRA_SERVER}/browse/{k}|{k}>*{app_str}: {insight}\n"
-
+  
     resp = requests.post(WEBHOOK_URL, headers={"Content-Type": "application/json"}, data=json.dumps({"text": msg}))
     if resp.status_code == 200:
         print("✅ Live Radar table broadcasted to Google Chat successfully!")
@@ -359,7 +359,7 @@ def broadcast_to_gchat(card_data, is_first_update=True, is_wrap_up=False):
     else:
         print(f"❌ Chat post failed: {resp.status_code}, {resp.text}")
         return False
-
+  
 # ==============================================================================
 # 6. MAIN ENGINE
 # ==============================================================================
@@ -369,18 +369,18 @@ def main():
     print(f"\n=======================================================")
     print(f"  RELEASERADAR LIVE FEED BOT | {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
     print(f"=======================================================")
-
+  
     # 1. Extract today's tickets from Sheet (Column-agnostic matching)
     sheet_tickets = get_today_deployments_from_sheet()
     if not sheet_tickets:
         print("No deployments found for today in the active sheet. Exiting.")
         return
-
+  
     # 2. Enrich with Jira deep context
     jira_service = JiraContextService()
     enriched = []
     all_done = True
-
+  
     for t in sheet_tickets:
         key = t["key"]
         jira_ctx = jira_service.fetch_ticket_deep_context(key)
@@ -389,7 +389,7 @@ def main():
         eff_status, eff_emoji = resolve_effective_status(t["sheet_status"], j_status)
         if eff_status != "Done":
             all_done = False
-
+  
         enriched.append({
             "key": key,
             "sheet_app": t["app"],
@@ -404,33 +404,71 @@ def main():
             "jira_comments": jira_ctx["comments"] if jira_ctx else [t.get("sheet_comments", "")],
             "jira_description": jira_ctx["description"] if jira_ctx else ""
         })
-
+  
     # 3. Handle First-run & Wrap-up State
     for fname in [FIRST_RUN_FILE, STATE_FILE]:
         if not os.path.exists(fname): open(fname, 'w').close()
-
+  
     is_first_run = True
     with open(FIRST_RUN_FILE, "r") as f:
         if f.read().strip() == today_str:
             is_first_run = False
-
+  
     is_deadline = now_ist.hour >= 21
     is_wrap_up = all_done or is_deadline
-
+  
     if is_wrap_up:
         with open(STATE_FILE, "r") as f:
             if f.read().strip() == today_str:
                 print("✅ Wrap-up update was already completed today. Exiting.")
                 return
-
+  
     # 4. Generate AI Summary & Live Radar
     analysis = analyze_with_gemini_2_5(enriched)
     if not analysis:
         return
-
+  
+    # --------------------------------------------------------------------------
+    # PERMANENT EMOJI & STATUS CORRECTION (POST-PROCESS STEP)
+    # --------------------------------------------------------------------------
+    # Create lookup maps from the verified source data
+    emoji_lookup = {item["key"].strip().upper(): item["effective_emoji"] for item in enriched}
+    status_lookup = {item["key"].strip().upper(): item["effective_status"] for item in enriched}
+  
+    # Fallback mappings in case change_no mapping misses
+    standard_emoji_map = {
+        "done": "✅", "completed": "✅", "closed": "✅", "resolved": "✅", "implemented": "✅", "success": "✅",
+        "white_check_mark": "✅", "check": "✅",
+        "in progress": "⚙️", "work in progress": "⚙️", "gear": "⚙️",
+        "pending": "⏳", "hourglass": "⏳", "hourglass_flowing_sand": "⏳",
+        "failed": "🚨", "fail": "🚨", "alarm": "🚨", "rotating_light": "🚨",
+        "rescheduled": "🚧", "cancel": "🚧", "construction": "🚧"
+    }
+  
+    if "deployments" in analysis and isinstance(analysis["deployments"], list):
+        for dep in analysis["deployments"]:
+            c_no = str(dep.get("change_no", "")).strip().upper()
+            
+            # 1. Restore from original verified Python source data (most secure option)
+            if c_no in emoji_lookup:
+                dep["status_emoji"] = emoji_lookup[c_no]
+                dep["status"] = status_lookup[c_no]
+            else:
+                # 2. Fallback: Clean up emoji shortcodes/strings if look-up fails
+                curr_emoji = str(dep.get("status_emoji", "")).strip().lower().replace(":", "").replace("-", "_")
+                curr_status = str(dep.get("status", "")).strip().lower()
+                
+                if curr_emoji in standard_emoji_map:
+                    dep["status_emoji"] = standard_emoji_map[curr_emoji]
+                elif curr_status in standard_emoji_map:
+                    dep["status_emoji"] = standard_emoji_map[curr_status]
+                else:
+                    dep["status_emoji"] = "⏳" # Standard fallback
+    # --------------------------------------------------------------------------
+  
     # 5. Send Broadcast
     success = broadcast_to_gchat(analysis, is_first_update=is_first_run, is_wrap_up=is_wrap_up)
-
+  
     if success:
         if is_first_run:
             with open(FIRST_RUN_FILE, "w") as f: f.write(today_str)
@@ -438,6 +476,6 @@ def main():
             with open(STATE_FILE, "w") as f: f.write(today_str)
         else:
             with open(STATE_FILE, "w") as f: f.write("")
-
+  
 if __name__ == "__main__":
     main()
